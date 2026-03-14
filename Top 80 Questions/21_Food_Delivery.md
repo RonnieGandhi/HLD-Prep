@@ -358,3 +358,29 @@ delivery_fee = base_fee + distance_fee + surge_fee
 - Multiple refund abuse by customers
 - Detect via: GPS verification at delivery address, photo proof of delivery, ML anomaly detection
 
+### Dispatch Matching Algorithm — The Core Challenge
+```
+Given: 100 ready orders + 80 available dashers. Assign optimally.
+
+Naive: nearest dasher to each restaurant. Problem: globally suboptimal.
+  Order A assigns Dasher X (closest). Order B's only option was also Dasher X.
+  Now Order B waits much longer.
+
+Optimal: Hungarian Algorithm (bipartite matching, O(n³)):
+  Build cost matrix: C[i][j] = cost of assigning dasher j to order i
+  Cost = α * distance_to_restaurant + β * estimated_delivery_time + γ * dasher_utilization
+  Solve for minimum total cost assignment.
+  
+  At 100 orders × 80 dashers: 100³ = 1M operations → < 10 ms. Fast enough.
+  Run every 30 seconds to batch assignments (not per-order — batching is better globally).
+
+Practical: at scale (10K orders × 5K dashers in a city), Hungarian is too slow.
+  Use: greedy approximation with local search refinement.
+  Or: LP relaxation (linear programming) solved with simplex method.
+  
+Real-time constraints:
+  Food goes cold: max 5 min from "ready" to pickup → hard deadline
+  Dasher at capacity: max 2 concurrent deliveries → constraint
+  Dasher preferences: some dashers prefer short trips → soft constraint
+```
+

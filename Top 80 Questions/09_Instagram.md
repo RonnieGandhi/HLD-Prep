@@ -371,3 +371,48 @@ Upload → NSFW Detection (ML) → Hate Speech (NLP) →
 - Recommendation engine: engagement-based + content understanding (video embeddings)
 - Pre-fetch next 3 reels for smooth scrolling experience
 
+### Feed Ranking Model — ML Deep Dive
+
+```
+Instagram's feed is NOT chronological. It's ranked by predicted engagement.
+
+Features fed to the ranking model:
+  User-author affinity:
+    - interaction_score: how often user likes/comments author's posts (decay over time)
+    - profile_visit_count: how often user visits author's profile
+    - DM frequency: users who DM each other see each other's posts first
+  
+  Post features:
+    - age_minutes: exponential decay (post from 1 hr ago >> post from 24 hrs ago)
+    - content_type: photo / video / carousel (video gets ~1.3x implicit boost)
+    - engagement_velocity: likes_in_first_30_min / impressions_in_first_30_min
+    - caption_length, hashtag_count, has_location
+  
+  Context features:
+    - time_of_day (user's local time), day_of_week
+    - session_number_today: 1st open = best content; 5th open = deeper inventory
+    - network_quality: on slow network, deprioritize video
+
+Model: Multi-task learning — predict P(like), P(comment), P(save), P(share), P(dwell_time > 3s)
+  Final score = w1*P(like) + w2*P(comment) + w3*P(save) + w4*P(share) + w5*P(dwell)
+  Weights: save and share are weighted highest (stronger engagement signals than likes)
+
+Serving: candidate generation (500 posts from fan-out cache) → ML ranking → top 50 served
+Latency budget: < 100 ms for scoring 500 candidates (batched inference, ONNX on CPU)
+Diversity injection: after ranking, ensure no 3 consecutive posts from same author
+```
+
+### Race Condition: Post Visible Before Media Processed
+
+```
+Problem: User creates post → metadata saved to DB → fan-out starts → followers see post
+  But media is still processing (resize, filter, moderation). Followers see broken image.
+
+Solution: Two-phase publishing
+  Phase 1: Upload media + process (resize, moderate). Post status = "processing"
+  Phase 2: Only after ALL media variants ready → set status = "published" → start fan-out
+  
+  Client shows spinner until post is "published" (typically 3-8 seconds).
+  Fan-out never triggers for "processing" posts → followers never see broken images.
+```
+

@@ -384,8 +384,3 @@ Validation before posting:
   This validation runs BEFORE the PostgreSQL transaction opens.
   Defense in depth: PostgreSQL trigger also validates sum = 0 per transaction_id.
 ```
-  Sufficient for any banking system.
-
-In application code: use BigDecimal (Java), Decimal (Python), not float/double.
-```
-
