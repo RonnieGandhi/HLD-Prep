@@ -1,486 +1,371 @@
-# System Design: Top 80 Questions
+# System Design Interview — 80 Problems with Solutions
 
-A comprehensive collection of **67 system design interview questions** with detailed solutions covering high-level architecture, capacity estimation, trade-offs, and implementation strategies.
-
----
-
-## 📚 Table of Contents
-
-1. [Overview](#overview)
-2. [Problem Classification](#problem-classification)
-3. [Problems by Category](#problems-by-category)
-4. [Problems by Complexity](#problems-by-complexity)
-5. [Key Concepts by Problem](#key-concepts-by-problem)
-6. [How to Use This Guide](#how-to-use-this-guide)
+A complete system design interview preparation guide with **80 detailed solutions**, each covering FR/NFR, capacity estimation, HLD architecture, APIs, data models, fault tolerance, and senior/staff-level deep dives.
 
 ---
 
-## Overview
+## How to Read This Guide
 
-This is a curated selection of system design problems commonly asked in senior engineer interviews at tech companies like Google, Amazon, Meta, Microsoft, and others. Each problem includes:
+Every question below is tagged with:
 
-- **Functional & Non-Functional Requirements**: What must the system do, and what qualities matter
-- **Capacity Estimations**: Back-of-the-envelope calculations
-- **High-Level Design (HLD)**: Architecture diagrams and component breakdown
-- **Deep Dives**: Database choices, caching strategies, scaling techniques
-- **Trade-offs**: When to use which approach and why
-- **Real-world Considerations**: Failure handling, monitoring, deployment
+- **Difficulty**: ⭐ Easy · ⭐⭐ Medium · ⭐⭐⭐ Hard
+- **Priority**: 🔴 Must-Do · 🟡 Should-Do · 🟢 Bonus
+- **Core Concepts** it teaches
 
----
+> **The 🔴 Must-Do set (25 problems) covers every major system design concept.** If you're short on time, doing only the 🔴 problems is sufficient. 🟡 Should-Do problems (25) reinforce concepts with different problem shapes. 🟢 Bonus problems (30) are for completeness or niche domains.
 
-## Problem Classification
+### Preparation Strategy
 
-Problems are grouped into **8 primary categories** based on their core domain:
-
-### 🌐 **Web Services & APIs** (7 problems)
-Short-lived requests, HTTP APIs, CRUD operations
-
-### 🏠 **Feed & Social** (9 problems)
-Real-time updates, ranking, personalization, graph-based queries
-
-### 🎯 **Search & Discovery** (6 problems)
-Indexing, ranking, inverted indexes, type-ahead
-
-### 💰 **Commerce & Marketplace** (5 problems)
-Transactions, inventory, payments, seller/buyer interactions
-
-### 🗺️ **Location & Mapping** (4 problems)
-Geospatial data, proximity queries, real-time tracking
-
-### 📊 **Analytics & Data** (9 problems)
-Stream processing, aggregations, time-series, metrics
-
-### 🎬 **Media & Streaming** (7 problems)
-Video/audio transcoding, CDNs, real-time delivery
-
-### 🛠️ **Infrastructure & Systems** (10 problems)
-Distributed systems, databases, caching, queues, load balancing
+| Time Available | What to Cover |
+|---|---|
+| **1 week** | All 🔴 Must-Do (25 problems) — covers every concept |
+| **2-3 weeks** | 🔴 + 🟡 Should-Do (50 problems) — strong across all categories |
+| **4+ weeks** | All 80 — complete mastery, niche domain depth |
 
 ---
 
-## Problems by Category
+## Concept Coverage Map
 
-### 🌐 Web Services & APIs
+These are the core concepts that appear in system design interviews. The 🔴 Must-Do set ensures you hit every one.
 
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 1 | [URL Shortener (TinyURL)](#01-url-shortener) | **⭐⭐ Easy** |
-| 2 | [API Rate Limiter](#02-api-rate-limiter) | **⭐⭐ Easy** |
-| 26 | [Pastebin](#26-pastebin) | **⭐⭐⭐ Medium** |
-| 24 | [Payment Gateway](#24-payment-gateway) | **⭐⭐⭐ Medium** |
-| 23 | [Ticketing System](#23-ticketing-system) | **⭐⭐⭐⭐ Hard** |
-| 25 | [Dropbox / Google Drive](#25-dropbox--google-drive) | **⭐⭐⭐⭐ Hard** |
-| 65 | [Inventory Management System](#65-inventory-management-system) | **⭐⭐⭐⭐ Hard** |
-
-### 🏠 Feed & Social
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 6 | [News Feed System (Facebook/Instagram)](#06-news-feed-system) | **⭐⭐⭐ Medium** |
-| 8 | [Twitter Timeline](#08-twitter-timeline) | **⭐⭐⭐ Medium** |
-| 9 | [Instagram](#09-instagram) | **⭐⭐⭐ Medium** |
-| 34 | [Live Likes & Reactions](#34-live-likes--reactions) | **⭐⭐⭐⭐ Hard** |
-| 35 | [Live Comments System](#35-live-comments-system) | **⭐⭐⭐⭐ Hard** |
-| 44 | [TikTok](#44-tiktok) | **⭐⭐⭐⭐ Hard** |
-| 48 | [Ephemeral Stories](#48-ephemeral-stories) | **⭐⭐⭐ Medium** |
-| 49 | [User Presence System](#49-user-presence-system) | **⭐⭐⭐ Medium** |
-| 51 | [Follower Following System](#51-follower-following-system) | **⭐⭐⭐ Medium** |
-
-### 🎯 Search & Discovery
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 11 | [Typeahead / Autocomplete](#11-typeahead-autocomplete) | **⭐⭐⭐ Medium** |
-| 12 | [Search Engine](#12-search-engine) | **⭐⭐⭐⭐ Hard** |
-| 13 | [Web Crawler](#13-web-crawler) | **⭐⭐⭐⭐ Hard** |
-| 42 | [Trending Topics](#42-trending-topics) | **⭐⭐⭐ Medium** |
-| 43 | [Top K Shared Articles](#43-top-k-shared-articles) | **⭐⭐⭐⭐ Hard** |
-| 14 | [Top K Rankings](#14-top-k-rankings) | **⭐⭐⭐⭐ Hard** |
-
-### 💰 Commerce & Marketplace
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 21 | [Food Delivery](#21-food-delivery) | **⭐⭐⭐⭐ Hard** |
-| 22 | [Ecommerce Platform](#22-ecommerce-platform) | **⭐⭐⭐⭐ Hard** |
-| 66 | [Shopping Cart System](#66-shopping-cart-system) | **⭐⭐⭐ Medium** |
-| 67 | [Flash Sale System](#67-flash-sale-system) | **⭐⭐⭐⭐ Hard** |
-| 45 | [Tinder](#45-tinder) | **⭐⭐⭐⭐ Hard** |
-
-### 🗺️ Location & Mapping
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 20 | [Proximity Server](#20-proximity-server) | **⭐⭐⭐ Medium** |
-| 19 | [Ride Hailing (Uber)](#19-ride-hailing-uber) | **⭐⭐⭐⭐ Hard** |
-| 53 | [Map Rendering & Navigation](#53-map-rendering--navigation) | **⭐⭐⭐⭐ Hard** |
-| 54 | [Geofencing Service](#54-geofencing-service) | **⭐⭐⭐ Medium** |
-| 55 | [Foursquare Checkins](#55-foursquare-checkins) | **⭐⭐⭐ Medium** |
-| 56 | [ETA Calculation Service](#56-eta-calculation-service) | **⭐⭐⭐⭐ Hard** |
-| 57 | [Real-time Vehicle Tracking](#57-realtime-vehicle-tracking) | **⭐⭐⭐ Medium** |
-| 58 | [Bike Sharing System](#58-bike-sharing-system) | **⭐⭐⭐⭐ Hard** |
-
-### 📊 Analytics & Data
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 3 | [Key-Value Store](#03-key-value-store) | **⭐⭐⭐ Medium** |
-| 16 | [Distributed Stream Processing](#16-distributed-stream-processing) | **⭐⭐⭐⭐ Hard** |
-| 32 | [Distributed Tracing](#32-distributed-tracing) | **⭐⭐⭐⭐ Hard** |
-| 37 | [User Analytics Pipeline](#37-user-analytics-pipeline) | **⭐⭐⭐⭐ Hard** |
-| 38 | [Distributed Metrics Aggregation](#38-distributed-metrics-aggregation) | **⭐⭐⭐ Medium** |
-| 39 | [Realtime Dashboard & Metrics](#39-realtime-dashboard--metrics) | **⭐⭐⭐ Medium** |
-| 40 | [Log Aggregation & Search](#40-log-aggregation--search) | **⭐⭐⭐⭐ Hard** |
-| 41 | [Like Count (High Profile)](#41-like-count-high-profile) | **⭐⭐⭐⭐ Hard** |
-
-### 🎬 Media & Streaming
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 15 | [Video Streaming Platform](#15-video-streaming-platform) | **⭐⭐⭐⭐ Hard** |
-| 17 | [CDN](#17-cdn) | **⭐⭐⭐⭐ Hard** |
-| 18 | [Music Streaming](#18-music-streaming) | **⭐⭐⭐ Medium** |
-| 59 | [Video Transcoding Pipeline](#59-video-transcoding-pipeline) | **⭐⭐⭐⭐ Hard** |
-| 60 | [Live Streaming Platform](#60-live-streaming-platform) | **⭐⭐⭐⭐ Hard** |
-| 61 | [Image Processing Pipeline](#61-image-processing-pipeline) | **⭐⭐⭐⭐ Hard** |
-| 62 | [Thumbnail Generation Service](#62-thumbnail-generation-service) | **⭐⭐⭐ Medium** |
-| 63 | [Podcast Delivery Platform](#63-podcast-delivery-platform) | **⭐⭐⭐⭐ Hard** |
-| 64 | [Video Recommendation Engine](#64-video-recommendation-engine) | **⭐⭐⭐⭐ Hard** |
-
-### 🛠️ Infrastructure & Systems
-
-| # | Problem | Complexity |
-|---|---------|-----------|
-| 4 | [Unique ID Generator](#04-unique-id-generator) | **⭐⭐ Easy** |
-| 5 | [Notification System](#05-notification-system) | **⭐⭐⭐ Medium** |
-| 7 | [Real-Time Chat](#07-real-time-chat) | **⭐⭐⭐⭐ Hard** |
-| 10 | [Reddit Discussion Forum](#10-reddit-discussion-forum) | **⭐⭐⭐⭐ Hard** |
-| 27 | [Distributed Cache](#27-distributed-cache) | **⭐⭐⭐⭐ Hard** |
-| 28 | [Distributed Job Scheduler](#28-distributed-job-scheduler) | **⭐⭐⭐⭐ Hard** |
-| 29 | [Distributed Lock Manager](#29-distributed-lock-manager) | **⭐⭐⭐ Medium** |
-| 30 | [Load Balancer](#30-load-balancer) | **⭐⭐⭐ Medium** |
-| 31 | [Distributed Queue](#31-distributed-queue) | **⭐⭐⭐⭐ Hard** |
-| 33 | [Event Sourcing System](#33-event-sourcing-system) | **⭐⭐⭐⭐ Hard** |
-| 36 | [On-Call Escalation System](#36-on-call-escalation-system) | **⭐⭐⭐ Medium** |
-| 46 | [Quora](#46-quora) | **⭐⭐⭐⭐ Hard** |
-| 47 | [Recommendation System](#47-recommendation-system) | **⭐⭐⭐⭐ Hard** |
-| 50 | [Social Graph Store](#50-social-graph-store) | **⭐⭐⭐⭐ Hard** |
-| 52 | [Mentions & Tagging System](#52-mentions--tagging-system) | **⭐⭐⭐ Medium** |
+| Concept | Covered By (🔴 Must-Do) |
+|---|---|
+| Hashing, key generation, encoding | 01 URL Shortener, 04 Unique ID |
+| Rate limiting, throttling | 02 Rate Limiter |
+| Caching (Redis, CDN, cache-aside) | 01, 06, 17, 27 |
+| SQL vs NoSQL, schema design | 03 Key-Value Store, 22 E-commerce |
+| Message queues, async processing | 05 Notification, 31 Queue |
+| Fan-out on write/read, feeds | 06 News Feed |
+| WebSockets, real-time communication | 07 Chat |
+| Search, inverted index, ranking | 12 Search Engine |
+| Web crawling, BFS, politeness | 13 Web Crawler |
+| Streaming, adaptive bitrate, CDN | 15 Video Streaming, 17 CDN |
+| Stream processing, Flink/Kafka | 16 Stream Processing |
+| Geospatial (H3, QuadTree, GeoHash) | 19 Uber, 20 Proximity |
+| ACID transactions, payments | 24 Payment Gateway |
+| File sync, chunking, delta | 25 Dropbox |
+| Distributed cache, consistent hashing | 27 Distributed Cache |
+| Job scheduling, cron at scale | 28 Job Scheduler |
+| Distributed locks, consensus | 29 Lock Manager |
+| Load balancing (L4/L7) | 30 Load Balancer |
+| Exactly-once, ordering, DLQ | 31 Distributed Queue |
+| Race conditions, seat booking | 23 Ticketing System |
+| Counters at scale, sharding | 41 Like Count |
+| ML ranking, recommendations | 47 Recommendation |
+| Event sourcing, CQRS | 33 Event Sourcing |
+| Fraud detection, ML pipelines | 74 Fraud Detection |
 
 ---
 
-## Problems by Complexity
+## All 80 Problems — Grouped by Category
 
-### ⭐⭐ Easy (Start Here!)
+### 🏗️ Core Infrastructure & Distributed Systems
 
-Great for beginners. Focus on core concepts: single-machine design, basic scaling, back-of-envelope math.
+These are the building blocks. Almost every other system uses these patterns.
 
-| # | Problem | Category |
-|---|---------|----------|
-| 1 | [URL Shortener (TinyURL)](#01-url-shortener) | Web Services |
-| 2 | [API Rate Limiter](#02-api-rate-limiter) | Web Services |
-| 4 | [Unique ID Generator](#04-unique-id-generator) | Infrastructure |
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 01 | [URL Shortener](Top%2080%20Questions/01_URL_Shortener.md) | ⭐ | 🔴 Must-Do | Hashing, Base62, KGS, Redis cache, Cassandra, read-heavy system |
+| 02 | [API Rate Limiter](Top%2080%20Questions/02_API_Rate_Limiter.md) | ⭐ | 🔴 Must-Do | Token bucket, sliding window, Redis Lua, distributed rate limiting |
+| 03 | [Key-Value Store](Top%2080%20Questions/03_Key_Value_Store.md) | ⭐⭐ | 🔴 Must-Do | LSM tree, WAL, compaction, replication, consistent hashing |
+| 04 | [Unique ID Generator](Top%2080%20Questions/04_Unique_ID_Generator.md) | ⭐ | 🔴 Must-Do | Snowflake, UUID, clock skew, k-sortable IDs |
+| 26 | [Pastebin](Top%2080%20Questions/26_Pastebin.md) | ⭐ | 🟢 Bonus | S3 storage, key generation — simpler version of URL Shortener |
+| 27 | [Distributed Cache](Top%2080%20Questions/27_Distributed_Cache.md) | ⭐⭐⭐ | 🔴 Must-Do | Consistent hashing, eviction policies, cache-aside/write-through, replication |
+| 28 | [Distributed Job Scheduler](Top%2080%20Questions/28_Distributed_Job_Scheduler.md) | ⭐⭐⭐ | 🔴 Must-Do | Cron at scale, task queues, idempotency, worker pools, dead-letter |
+| 29 | [Distributed Lock Manager](Top%2080%20Questions/29_Distributed_Lock_Manager.md) | ⭐⭐ | 🔴 Must-Do | Redlock, ZooKeeper, fencing tokens, consensus, TTL |
+| 30 | [Load Balancer](Top%2080%20Questions/30_Load_Balancer.md) | ⭐⭐ | 🔴 Must-Do | L4/L7, round-robin, least-connections, health checks, sticky sessions |
+| 31 | [Distributed Queue](Top%2080%20Questions/31_Distributed_Queue.md) | ⭐⭐⭐ | 🔴 Must-Do | Ordering guarantees, at-least-once/exactly-once, partitioning, DLQ, backpressure |
+| 33 | [Event Sourcing System](Top%2080%20Questions/33_Event_Sourcing_System.md) | ⭐⭐⭐ | 🔴 Must-Do | Event log, CQRS, snapshots, temporal queries, replay |
 
-**What you'll learn:**
-- Basic cache design (Redis)
-- Database indexing & queries
-- Back-of-the-envelope calculations
-- Load balancing basics
-- TTL-based expiration
-
----
-
-### ⭐⭐⭐ Medium (Build Confidence)
-
-Intermediate problems. Introduce distributed systems, caching, basic data structures, eventual consistency.
-
-| # | Problem | Category | Key Concepts |
-|---|---------|----------|--------------|
-| 3 | [Key-Value Store](#03-key-value-store) | Analytics | In-memory storage, partitioning |
-| 5 | [Notification System](#05-notification-system) | Infrastructure | Message queues, asynchronous processing |
-| 6 | [News Feed System](#06-news-feed-system) | Feed & Social | Fan-out, cache invalidation |
-| 8 | [Twitter Timeline](#08-twitter-timeline) | Feed & Social | Timeline ranking, eventual consistency |
-| 9 | [Instagram](#09-instagram) | Feed & Social | Feed generation, photo storage |
-| 11 | [Typeahead / Autocomplete](#11-typeahead-autocomplete) | Search | Trie data structures, prefix search |
-| 18 | [Music Streaming](#18-music-streaming) | Media | CDN, streaming protocols |
-| 20 | [Proximity Server](#20-proximity-server) | Location | Geohashing, QuadTree |
-| 24 | [Payment Gateway](#24-payment-gateway) | Commerce | Transaction safety, idempotency |
-| 26 | [Pastebin](#26-pastebin) | Web Services | Object storage, access control |
-| 29 | [Distributed Lock Manager](#29-distributed-lock-manager) | Infrastructure | Consensus, distributed locks |
-| 30 | [Load Balancer](#30-load-balancer) | Infrastructure | L4/L7 balancing, health checks |
-| 36 | [On-Call Escalation System](#36-on-call-escalation-system) | Infrastructure | State machines, priority queues |
-| 38 | [Distributed Metrics Aggregation](#38-distributed-metrics-aggregation) | Analytics | Time-series, aggregation |
-| 39 | [Realtime Dashboard & Metrics](#39-realtime-dashboard--metrics) | Analytics | Real-time updates, WebSockets |
-| 42 | [Trending Topics](#42-trending-topics) | Search | Counting, time-window bucketing |
-| 48 | [Ephemeral Stories](#48-ephemeral-stories) | Feed & Social | Time-based deletion, caching |
-| 49 | [User Presence System](#49-user-presence-system) | Feed & Social | Heartbeats, status updates |
-| 51 | [Follower Following System](#51-follower-following-system) | Feed & Social | Graph design, denormalization |
-| 52 | [Mentions & Tagging System](#52-mentions--tagging-system) | Infrastructure | Indexing, @-mention resolution |
-| 54 | [Geofencing Service](#54-geofencing-service) | Location | Geo-indexes, event streaming |
-| 55 | [Foursquare Checkins](#55-foursquare-checkins) | Location | Time-series, analytics |
-| 57 | [Real-time Vehicle Tracking](#57-realtime-vehicle-tracking) | Location | Real-time updates, compression |
-| 62 | [Thumbnail Generation Service](#62-thumbnail-generation-service) | Media | Async processing, image handling |
-| 66 | [Shopping Cart System](#66-shopping-cart-system) | Commerce | Caching, consistency |
-
-**What you'll learn:**
-- Distributed caching (Redis)
-- Message queues (Kafka, RabbitMQ)
-- Data structure design choices
-- Real-time update patterns
-- Geospatial indexing
+> **After these 11 problems**, you understand: caching, hashing, queues, scheduling, locking, load balancing, event-driven architecture, and all fundamental distributed systems patterns.
 
 ---
 
-### ⭐⭐⭐⭐ Hard (Master Level)
+### 📱 Social, Feed & Real-Time
 
-Advanced problems. Heavy on trade-offs, distributed algorithms, consistency models, complex architectures.
+The most commonly asked category. Feeds, chat, and social features appear in ~40% of interviews.
 
-| # | Problem | Category | Key Concepts |
-|---|---------|----------|--------------|
-| 7 | [Real-Time Chat](#07-real-time-chat) | Infrastructure | WebSockets, message ordering |
-| 10 | [Reddit Discussion Forum](#10-reddit-discussion-forum) | Infrastructure | Nested comments, tree traversal |
-| 12 | [Search Engine](#12-search-engine) | Search | Inverted indexes, ranking, distributed search |
-| 13 | [Web Crawler](#13-web-crawler) | Search | BFS/DFS, politeness, robots.txt |
-| 14 | [Top K Rankings](#14-top-k-rankings) | Search | Heap algorithms, sharding |
-| 15 | [Video Streaming Platform](#15-video-streaming-platform) | Media | Adaptive bitrate, buffering, CDN |
-| 16 | [Distributed Stream Processing](#16-distributed-stream-processing) | Analytics | Stream joins, windowing, stateful processing |
-| 17 | [CDN](#17-cdn) | Media | Edge caching, geo-routing, cache coherence |
-| 19 | [Ride Hailing (Uber)](#19-ride-hailing-uber) | Location | Matching, ranking, real-time updates |
-| 21 | [Food Delivery](#21-food-delivery) | Commerce | Multi-party matching, delivery optimization |
-| 22 | [Ecommerce Platform](#22-ecommerce-platform) | Commerce | Inventory consistency, payment integration |
-| 23 | [Ticketing System](#23-ticketing-system) | Web Services | Race conditions, database transactions |
-| 25 | [Dropbox / Google Drive](#25-dropbox--google-drive) | Web Services | File sync, versioning, delta encoding |
-| 27 | [Distributed Cache](#27-distributed-cache) | Infrastructure | Consistent hashing, eviction, replication |
-| 28 | [Distributed Job Scheduler](#28-distributed-job-scheduler) | Infrastructure | Scheduling, fault tolerance, resource allocation |
-| 31 | [Distributed Queue](#31-distributed-queue) | Infrastructure | Message ordering, acknowledgment, dead-letter queues |
-| 32 | [Distributed Tracing](#32-distributed-tracing) | Analytics | Span collection, distributed context, sampling |
-| 33 | [Event Sourcing System](#33-event-sourcing-system) | Infrastructure | Event logs, CQRS, temporal queries |
-| 34 | [Live Likes & Reactions](#34-live-likes--reactions) | Feed & Social | High-throughput counters, aggregation |
-| 35 | [Live Comments System](#35-live-comments-system) | Feed & Social | Message ordering, notification storm |
-| 37 | [User Analytics Pipeline](#37-user-analytics-pipeline) | Analytics | ETL, batch + real-time, data warehouse |
-| 40 | [Log Aggregation & Search](#40-log-aggregation--search) | Analytics | Full-text search, distributed logging, indexing |
-| 41 | [Like Count (High Profile)](#41-like-count-high-profile) | Analytics | Eventually consistent counters, race conditions |
-| 43 | [Top K Shared Articles](#43-top-k-shared-articles) | Search | Leaderboards, time-decay ranking |
-| 44 | [TikTok](#44-tiktok) | Feed & Social | Complex ranking, real-time engagement, graph |
-| 45 | [Tinder](#45-tinder) | Commerce | Matching algorithms, recommendation, real-time |
-| 46 | [Quora](#46-quora) | Infrastructure | Content discovery, ranking, user engagement |
-| 47 | [Recommendation System](#47-recommendation-system) | Infrastructure | ML embeddings, candidate generation, ranking |
-| 50 | [Social Graph Store](#50-social-graph-store) | Infrastructure | Graph databases, replication, query patterns |
-| 53 | [Map Rendering & Navigation](#53-map-rendering--navigation) | Location | Tile generation, geo-partitioning, routing |
-| 56 | [ETA Calculation Service](#56-eta-calculation-service) | Location | ML predictions, feature engineering, real-time |
-| 58 | [Bike Sharing System](#58-bike-sharing-system) | Location | Rebalancing, demand forecasting, transactions |
-| 59 | [Video Transcoding Pipeline](#59-video-transcoding-pipeline) | Media | Job distribution, resource pooling, monitoring |
-| 60 | [Live Streaming Platform](#60-live-streaming-platform) | Media | Multi-bitrate, low latency, real-time synchronization |
-| 61 | [Image Processing Pipeline](#61-image-processing-pipeline) | Media | Async job queue, resizing, format conversion |
-| 63 | [Podcast Delivery Platform](#63-podcast-delivery-platform) | Media | CDN, caching, subscription, progress tracking |
-| 64 | [Video Recommendation Engine](#64-video-recommendation-engine) | Media | ML pipeline, feature store, online serving |
-| 65 | [Inventory Management System](#65-inventory-management-system) | Commerce | Stock consistency, reservations, distributed locks |
-| 67 | [Flash Sale System](#67-flash-sale-system) | Commerce | Rate limiting, inventory depletion, fairness |
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 06 | [News Feed System](Top%2080%20Questions/06_News_Feed_System.md) | ⭐⭐ | 🔴 Must-Do | Fan-out on write vs read, feed ranking, cache invalidation, hybrid approach |
+| 07 | [Real-Time Chat](Top%2080%20Questions/07_Real_Time_Chat.md) | ⭐⭐⭐ | 🔴 Must-Do | WebSockets, message ordering, delivery receipts, presence, group chat |
+| 05 | [Notification System](Top%2080%20Questions/05_Notification_System.md) | ⭐⭐ | 🔴 Must-Do | Multi-channel (push/email/SMS), priority queues, templating, rate limiting |
+| 08 | [Twitter Timeline](Top%2080%20Questions/08_Twitter_Timeline.md) | ⭐⭐ | 🟡 Should-Do | Same as News Feed but with trending, Count-Min Sketch — reinforces fan-out |
+| 09 | [Instagram](Top%2080%20Questions/09_Instagram.md) | ⭐⭐ | 🟡 Should-Do | Photo upload pipeline, CDN, media processing, feed ranking ML |
+| 10 | [Reddit Discussion Forum](Top%2080%20Questions/10_Reddit_Discussion_Forum.md) | ⭐⭐⭐ | 🟡 Should-Do | Threaded comments (tree), voting, hot/best ranking algorithms |
+| 44 | [TikTok](Top%2080%20Questions/44_TikTok.md) | ⭐⭐⭐ | 🟡 Should-Do | Interest-graph feed (not social-graph), video pipeline, cold-start |
+| 46 | [Quora](Top%2080%20Questions/46_Quora.md) | ⭐⭐⭐ | 🟢 Bonus | Q&A ranking, Wilson score, SEO, collaborative editing |
+| 34 | [Live Likes & Reactions](Top%2080%20Questions/34_Live_Likes_Reactions.md) | ⭐⭐ | 🟡 Should-Do | High-throughput counters, WebSocket broadcast, batching |
+| 35 | [Live Comments System](Top%2080%20Questions/35_Live_Comments_System.md) | ⭐⭐ | 🟢 Bonus | Ordered real-time stream, fan-out to viewers — similar to 34 |
+| 41 | [Like Count for High Profile](Top%2080%20Questions/41_Like_Count_High_Profile.md) | ⭐⭐⭐ | 🔴 Must-Do | Sharded counters, Bloom filter dedup, eventual consistency, Redis vs Cassandra |
+| 48 | [Ephemeral Stories](Top%2080%20Questions/48_Ephemeral_Stories.md) | ⭐⭐ | 🟢 Bonus | TTL-based deletion, story ring, view tracking — subset of Instagram |
+| 49 | [User Presence System](Top%2080%20Questions/49_User_Presence_System.md) | ⭐⭐ | 🟡 Should-Do | Heartbeat, last-seen, fan-out presence to friends, Redis pub/sub |
+| 50 | [Social Graph Store](Top%2080%20Questions/50_Social_Graph_Store.md) | ⭐⭐⭐ | 🟡 Should-Do | Adjacency list, graph traversal, mutual friends, TAO-style cache |
+| 51 | [Follower/Following System](Top%2080%20Questions/51_Follower_Following_System.md) | ⭐⭐ | 🟢 Bonus | Celebrity hot-spot, counter sync — subset of Social Graph |
+| 52 | [Mentions & Tagging](Top%2080%20Questions/52_Mentions_Tagging_System.md) | ⭐⭐ | 🟢 Bonus | @-mention parsing, autocomplete, notification fan-out |
 
-**What you'll learn:**
-- Distributed consensus & transactions
-- Complex caching strategies
-- Event-driven architectures
-- Machine learning pipelines
-- Multi-region deployment
-- Advanced database design (sharding, replication)
-- Real-time systems at scale
-- Trade-offs between consistency, availability, partition tolerance
+> **After 06, 07, 05, 41** you've covered fan-out, real-time communication, notifications, and counters at scale. The rest reinforce with variations.
 
 ---
 
-## Key Concepts by Problem
+### 🔍 Search, Ranking & Discovery
 
-### Concepts Grid
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 11 | [Typeahead / Autocomplete](Top%2080%20Questions/11_Typeahead_Autocomplete.md) | ⭐⭐ | 🟡 Should-Do | Trie, prefix search, top-K per node, hot-swap serving |
+| 12 | [Search Engine](Top%2080%20Questions/12_Search_Engine.md) | ⭐⭐⭐ | 🔴 Must-Do | Inverted index, BM25, PageRank, distributed index sharding, tiered serving |
+| 13 | [Web Crawler](Top%2080%20Questions/13_Web_Crawler.md) | ⭐⭐⭐ | 🔴 Must-Do | BFS/DFS, URL frontier, politeness, dedup (Bloom filter), robots.txt |
+| 14 | [Top K Rankings](Top%2080%20Questions/14_Top_K_Rankings.md) | ⭐⭐⭐ | 🟡 Should-Do | Min-heap, approximate counting, Redis sorted sets, time-window ranking |
+| 42 | [Trending Topics](Top%2080%20Questions/42_Trending_Topics.md) | ⭐⭐ | 🟡 Should-Do | Velocity-based scoring, Count-Min Sketch, sliding window, Flink |
+| 43 | [Top K Shared Articles](Top%2080%20Questions/43_Top_K_Shared_Articles.md) | ⭐⭐⭐ | 🟢 Bonus | Time-decay leaderboard — similar to 14 + 42 combined |
+| 47 | [Recommendation System](Top%2080%20Questions/47_Recommendation_System.md) | ⭐⭐⭐ | 🔴 Must-Do | Collaborative filtering, embeddings, ANN (FAISS), candidate gen + ranking, feature store |
 
-Below is a map of which problems emphasize which key concepts:
-
-| Concept | Problems | Difficulty |
-|---------|----------|-----------|
-| **Caching (Redis/Memcached)** | 1, 6, 8, 9, 11, 18, 20, 27, 39, 49 | Easy - Hard |
-| **Distributed Systems** | 7, 13, 16, 27, 28, 29, 31, 32, 33, 40, 50 | Medium - Hard |
-| **Database Design** | 3, 6, 8, 22, 25, 46, 50 | Medium - Hard |
-| **Real-Time Updates** | 7, 34, 35, 39, 44, 49, 57, 60 | Medium - Hard |
-| **Search & Indexing** | 11, 12, 13, 40, 42, 43, 47 | Medium - Hard |
-| **Geospatial** | 20, 53, 54, 55, 56, 57, 58 | Medium - Hard |
-| **Machine Learning** | 11, 42, 44, 45, 47, 64 | Medium - Hard |
-| **Message Queues** | 5, 16, 31, 37, 59, 61 | Medium - Hard |
-| **Stream Processing** | 16, 37, 39, 40, 41, 42 | Hard |
-| **High Availability** | 1, 15, 17, 22, 25, 27, 60 | Easy - Hard |
-| **Consistency & Transactions** | 22, 23, 24, 25, 33, 65, 67 | Medium - Hard |
+> **12, 13, 47** cover the three pillars: indexing/search, crawling/data ingestion, and ML-based ranking. 11, 14, 42 are good reinforcement.
 
 ---
 
-## How to Use This Guide
+### 🛒 E-Commerce, Payments & Transactions
 
-### 🎯 For Interview Preparation
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 22 | [E-Commerce Platform](Top%2080%20Questions/22_Ecommerce_Platform.md) | ⭐⭐⭐ | 🟡 Should-Do | Catalog, cart, checkout, search, microservice orchestration |
+| 23 | [Ticketing System](Top%2080%20Questions/23_Ticketing_System.md) | ⭐⭐⭐ | 🔴 Must-Do | Seat reservation race condition, SELECT FOR UPDATE, hold-and-confirm, TTL release |
+| 24 | [Payment Gateway](Top%2080%20Questions/24_Payment_Gateway.md) | ⭐⭐⭐ | 🔴 Must-Do | ACID, idempotency keys, double-entry ledger, PSP integration, reconciliation |
+| 65 | [Inventory Management](Top%2080%20Questions/65_Inventory_Management_System.md) | ⭐⭐⭐ | 🟡 Should-Do | Two-phase reserve/confirm, multi-warehouse, Redis+PG sync |
+| 66 | [Shopping Cart System](Top%2080%20Questions/66_Shopping_Cart_System.md) | ⭐⭐ | 🟢 Bonus | Redis Hash, guest-to-login merge, price validation — simpler subset |
+| 67 | [Flash Sale System](Top%2080%20Questions/67_Flash_Sale_System.md) | ⭐⭐⭐ | 🟡 Should-Do | Redis Lua atomic scripts, virtual queue, anti-bot, extreme concurrency |
+| 68 | [Order Management System](Top%2080%20Questions/68_Order_Management_System.md) | ⭐⭐⭐ | 🟡 Should-Do | SAGA pattern, state machine, compensation, split shipments |
+| 69 | [Review & Rating System](Top%2080%20Questions/69_Review_Rating_System.md) | ⭐⭐ | 🟢 Bonus | Pre-computed aggregates, Bayesian average, Wilson score, fake detection |
+| 70 | [Price Comparison Engine](Top%2080%20Questions/70_Price_Comparison_Engine.md) | ⭐⭐ | 🟢 Bonus | Product matching (NLP), scraper fleet, price history |
+| 71 | [Coupon & Discount Engine](Top%2080%20Questions/71_Coupon_Discount_Engine.md) | ⭐⭐ | 🟢 Bonus | Rule engine, stacking, Redis atomic usage limits |
 
-**Week 1-2: Easy Problems**
-- Start with problems 1, 2, 4
-- Focus on back-of-the-envelope math
-- Draw simple architectures
-- Practice explaining trade-offs
-
-**Week 3-4: Medium Problems**
-- Pick 3-5 from the Medium category
-- Focus on database choices
-- Understand cache invalidation
-- Learn real-time patterns
-
-**Week 5-8: Hard Problems**
-- Tackle 4-6 hard problems
-- Deep dive into one category (e.g., Feed & Social)
-- Study distributed algorithms
-- Practice handling follow-up questions
-
-### 📖 For System Design Learning
-
-1. **Read the functional & non-functional requirements first**
-   - Understand constraints before designing
-
-2. **Do capacity estimation yourself before reading**
-   - Build intuition for scale
-
-3. **Study the HLD diagram**
-   - Trace a request through the system
-
-4. **Deep dive into critical components**
-   - Database choice, cache strategy, consistency model
-
-5. **Think through edge cases**
-   - What breaks under load? How do you recover?
-
-### 🔄 Study Patterns by Concept
-
-Group problems by concept you want to master:
-
-**Want to master caching?** → Study: 1, 6, 8, 9, 27
-**Want to master real-time?** → Study: 7, 34, 35, 39, 44, 60
-**Want to master distributed systems?** → Study: 27, 28, 31, 32, 33, 50
-**Want to master search?** → Study: 11, 12, 13, 40, 42, 43
+> **23, 24** are the must-dos — they teach ACID transactions, race conditions, and idempotency. 67 is great for extreme concurrency. The rest are domain-specific variations.
 
 ---
 
-## Problem Quick Links
+### 🗺️ Location, Geo & Ride-Hailing
 
-### Web Services & APIs
-- [01 URL Shortener](#01-url-shortener)
-- [02 API Rate Limiter](#02-api-rate-limiter)
-- [24 Payment Gateway](#24-payment-gateway)
-- [25 Dropbox / Google Drive](#25-dropbox--google-drive)
-- [26 Pastebin](#26-pastebin)
-- [23 Ticketing System](#23-ticketing-system)
-- [65 Inventory Management System](#65-inventory-management-system)
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 19 | [Ride-Hailing (Uber)](Top%2080%20Questions/19_Ride_Hailing_Uber.md) | ⭐⭐⭐ | 🔴 Must-Do | Driver matching, geospatial index, ETA, dispatch, real-time tracking |
+| 20 | [Proximity Server](Top%2080%20Questions/20_Proximity_Server.md) | ⭐⭐ | 🔴 Must-Do | GeoHash, QuadTree, R-tree, nearby search, boundary problem |
+| 21 | [Food Delivery](Top%2080%20Questions/21_Food_Delivery.md) | ⭐⭐⭐ | 🟡 Should-Do | Multi-party (customer/restaurant/driver), SAGA, dispatch matching |
+| 45 | [Tinder](Top%2080%20Questions/45_Tinder.md) | ⭐⭐⭐ | 🟡 Should-Do | Geospatial + recommendation hybrid, swipe queue, mutual match |
+| 53 | [Map Rendering & Navigation](Top%2080%20Questions/53_Map_Rendering_Navigation.md) | ⭐⭐⭐ | 🟢 Bonus | Tile pyramid, Dijkstra/A*, road graph, vector tiles |
+| 54 | [Geofencing Service](Top%2080%20Questions/54_Geofencing_Service.md) | ⭐⭐ | 🟢 Bonus | Point-in-polygon, R-tree, enter/exit events — subset of 20 |
+| 55 | [Foursquare (Check-ins)](Top%2080%20Questions/55_Foursquare_Checkins.md) | ⭐⭐ | 🟢 Bonus | Venue discovery, mayorship, recommendation — variation of 20 |
+| 56 | [ETA Calculation](Top%2080%20Questions/56_ETA_Calculation_Service.md) | ⭐⭐⭐ | 🟢 Bonus | ML-based ETA, historical traffic, graph algorithms |
+| 57 | [Real-Time Vehicle Tracking](Top%2080%20Questions/57_Realtime_Vehicle_Tracking.md) | ⭐⭐ | 🟢 Bonus | High-frequency GPS ingestion, Kafka, time-series — subset of 19 |
+| 58 | [Bike Sharing System](Top%2080%20Questions/58_Bike_Sharing_System.md) | ⭐⭐⭐ | 🟢 Bonus | Dock availability, rebalancing, demand forecasting |
+| 72 | [Surge Pricing System](Top%2080%20Questions/72_Surge_Pricing_System.md) | ⭐⭐⭐ | 🟢 Bonus | H3 hexagons, supply/demand ratio, Flink window, smoothing |
 
-### Feed & Social
-- [06 News Feed System](#06-news-feed-system)
-- [08 Twitter Timeline](#08-twitter-timeline)
-- [09 Instagram](#09-instagram)
-- [34 Live Likes & Reactions](#34-live-likes--reactions)
-- [35 Live Comments System](#35-live-comments-system)
-- [44 TikTok](#44-tiktok)
-- [48 Ephemeral Stories](#48-ephemeral-stories)
-- [49 User Presence System](#49-user-presence-system)
-- [51 Follower Following System](#51-follower-following-system)
-
-### Search & Discovery
-- [11 Typeahead / Autocomplete](#11-typeahead-autocomplete)
-- [12 Search Engine](#12-search-engine)
-- [13 Web Crawler](#13-web-crawler)
-- [14 Top K Rankings](#14-top-k-rankings)
-- [42 Trending Topics](#42-trending-topics)
-- [43 Top K Shared Articles](#43-top-k-shared-articles)
-- [46 Quora](#46-quora)
-- [47 Recommendation System](#47-recommendation-system)
-
-### Commerce & Marketplace
-- [19 Ride Hailing (Uber)](#19-ride-hailing-uber)
-- [21 Food Delivery](#21-food-delivery)
-- [22 Ecommerce Platform](#22-ecommerce-platform)
-- [45 Tinder](#45-tinder)
-- [66 Shopping Cart System](#66-shopping-cart-system)
-- [67 Flash Sale System](#67-flash-sale-system)
-
-### Location & Mapping
-- [20 Proximity Server](#20-proximity-server)
-- [53 Map Rendering & Navigation](#53-map-rendering--navigation)
-- [54 Geofencing Service](#54-geofencing-service)
-- [55 Foursquare Checkins](#55-foursquare-checkins)
-- [56 ETA Calculation Service](#56-eta-calculation-service)
-- [57 Real-time Vehicle Tracking](#57-realtime-vehicle-tracking)
-- [58 Bike Sharing System](#58-bike-sharing-system)
-
-### Analytics & Data
-- [03 Key-Value Store](#03-key-value-store)
-- [16 Distributed Stream Processing](#16-distributed-stream-processing)
-- [32 Distributed Tracing](#32-distributed-tracing)
-- [37 User Analytics Pipeline](#37-user-analytics-pipeline)
-- [38 Distributed Metrics Aggregation](#38-distributed-metrics-aggregation)
-- [39 Realtime Dashboard & Metrics](#39-realtime-dashboard--metrics)
-- [40 Log Aggregation & Search](#40-log-aggregation--search)
-- [41 Like Count (High Profile)](#41-like-count-high-profile)
-
-### Media & Streaming
-- [15 Video Streaming Platform](#15-video-streaming-platform)
-- [17 CDN](#17-cdn)
-- [18 Music Streaming](#18-music-streaming)
-- [59 Video Transcoding Pipeline](#59-video-transcoding-pipeline)
-- [60 Live Streaming Platform](#60-live-streaming-platform)
-- [61 Image Processing Pipeline](#61-image-processing-pipeline)
-- [62 Thumbnail Generation Service](#62-thumbnail-generation-service)
-- [63 Podcast Delivery Platform](#63-podcast-delivery-platform)
-- [64 Video Recommendation Engine](#64-video-recommendation-engine)
-
-### Infrastructure & Systems
-- [04 Unique ID Generator](#04-unique-id-generator)
-- [05 Notification System](#05-notification-system)
-- [07 Real-Time Chat](#07-real-time-chat)
-- [10 Reddit Discussion Forum](#10-reddit-discussion-forum)
-- [27 Distributed Cache](#27-distributed-cache)
-- [28 Distributed Job Scheduler](#28-distributed-job-scheduler)
-- [29 Distributed Lock Manager](#29-distributed-lock-manager)
-- [30 Load Balancer](#30-load-balancer)
-- [31 Distributed Queue](#31-distributed-queue)
-- [33 Event Sourcing System](#33-event-sourcing-system)
-- [36 On-Call Escalation System](#36-on-call-escalation-system)
-- [50 Social Graph Store](#50-social-graph-store)
-- [52 Mentions & Tagging System](#52-mentions--tagging-system)
+> **19, 20** cover all geospatial fundamentals. 21 and 45 add multi-party coordination. 53-58, 72 are niche unless interviewing for a mapping/logistics company.
 
 ---
 
-## 📊 Statistics
+### 🎬 Media, Streaming & Content
 
-| Metric | Value |
-|--------|-------|
-| **Total Problems** | 67 |
-| **Easy Problems** | 3 (4%) |
-| **Medium Problems** | 25 (37%) |
-| **Hard Problems** | 39 (58%) |
-| **Categories** | 8 |
-| **Most Common Concepts** | Caching, Distributed Systems, Real-Time Updates |
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 15 | [Video Streaming (YouTube/Netflix)](Top%2080%20Questions/15_Video_Streaming_Platform.md) | ⭐⭐⭐ | 🔴 Must-Do | HLS/DASH, adaptive bitrate, transcoding, CDN, DRM |
+| 17 | [Content Delivery Network](Top%2080%20Questions/17_CDN.md) | ⭐⭐⭐ | 🔴 Must-Do | Edge caching, PoP, cache invalidation, origin shield, Anycast |
+| 18 | [Music Streaming (Spotify)](Top%2080%20Questions/18_Music_Streaming.md) | ⭐⭐ | 🟡 Should-Do | Audio codecs, offline mode, queue sync, royalty tracking |
+| 25 | [Dropbox / Google Drive](Top%2080%20Questions/25_Dropbox_Google_Drive.md) | ⭐⭐⭐ | 🔴 Must-Do | Chunking, delta sync, conflict resolution, dedup, metadata DB |
+| 59 | [Video Transcoding Pipeline](Top%2080%20Questions/59_Video_Transcoding_Pipeline.md) | ⭐⭐⭐ | 🟡 Should-Do | DAG orchestration, worker pools, GPU vs CPU, codec ladder |
+| 60 | [Live Streaming (Twitch)](Top%2080%20Questions/60_Live_Streaming_Platform.md) | ⭐⭐⭐ | 🟡 Should-Do | RTMP ingest, LL-HLS, real-time transcoding, chat integration |
+| 61 | [Image Processing Pipeline](Top%2080%20Questions/61_Image_Processing_Pipeline.md) | ⭐⭐ | 🟢 Bonus | Resize, format conversion, ML inference — simpler version of 59 |
+| 62 | [Thumbnail Generation](Top%2080%20Questions/62_Thumbnail_Generation_Service.md) | ⭐⭐ | 🟢 Bonus | ML frame selection, async workers — subset of 59 |
+| 63 | [Podcast Delivery Platform](Top%2080%20Questions/63_Podcast_Delivery_Platform.md) | ⭐⭐ | 🟢 Bonus | RSS ingestion, episode delivery, progress sync — simpler Spotify |
+| 64 | [Video Recommendation Engine](Top%2080%20Questions/64_Video_Recommendation_Engine.md) | ⭐⭐⭐ | 🟢 Bonus | Two-tower model, FAISS, feature store — variation of 47 |
 
----
-
-## 🎓 Recommended Reading Order
-
-### Option 1: By Difficulty (Beginner Friendly)
-1. Start: 1, 2, 4
-2. Ramp: 3, 5, 6, 11, 20
-3. Master: 27, 28, 31, 32, 33
-
-### Option 2: By Category (Deep Dive)
-- **Pick a category** (e.g., Feed & Social)
-- **Solve all problems in order of difficulty**
-- **Compare design patterns between similar problems**
-
-### Option 3: By Interview Target (Company-Focused)
-- **Google/Meta** → Feed & Social + Search: 6, 8, 9, 11, 12, 13, 42, 43, 47
-- **Amazon/Uber** → Commerce & Location: 19, 21, 22, 45, 56, 58
-- **Microsoft/Apple** → Infrastructure: 27, 28, 31, 32, 33, 50
-- **Bloomberg/Stripe** → Web Services & Analytics: 1, 2, 24, 37, 40, 41
+> **15, 17, 25** are must-dos. 59, 60 add depth on transcoding and live delivery. 61-64 are variations unless you're targeting a media company.
 
 ---
 
-**Happy learning! 🚀**
+### 📊 Analytics, Observability & Data Pipelines
 
-Each problem file contains detailed sections on functional requirements, capacity estimation, high-level design, deep dives, and trade-offs. Use this README as your navigation guide.
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 16 | [Distributed Stream Processing](Top%2080%20Questions/16_Distributed_Stream_Processing.md) | ⭐⭐⭐ | 🔴 Must-Do | Kafka internals, partitioning, consumer groups, exactly-once, windowing |
+| 32 | [Distributed Tracing](Top%2080%20Questions/32_Distributed_Tracing.md) | ⭐⭐⭐ | 🟡 Should-Do | Span propagation, head-based vs tail-based sampling |
+| 36 | [On-Call Escalation System](Top%2080%20Questions/36_OnCall_Escalation_System.md) | ⭐⭐ | 🟢 Bonus | State machine, escalation chains, schedule rotation |
+| 37 | [User Analytics Pipeline](Top%2080%20Questions/37_User_Analytics_Pipeline.md) | ⭐⭐⭐ | 🟡 Should-Do | Lambda architecture, Spark batch + Flink real-time, ClickHouse |
+| 38 | [Distributed Metrics Aggregation](Top%2080%20Questions/38_Distributed_Metrics_Aggregation.md) | ⭐⭐ | 🟢 Bonus | Time-series roll-up, Prometheus, pre-aggregation — overlaps with 39 |
+| 39 | [Real-Time Dashboard](Top%2080%20Questions/39_Realtime_Dashboard_Metrics.md) | ⭐⭐ | 🟢 Bonus | WebSocket push, materialized views — consumer of 37/38 |
+| 40 | [Log Aggregation & Search](Top%2080%20Questions/40_Log_Aggregation_Search.md) | ⭐⭐⭐ | 🟡 Should-Do | ELK stack, log shipping, index lifecycle, hot/warm/cold |
+| 79 | [A/B Testing Platform](Top%2080%20Questions/79_AB_Testing_Platform.md) | ⭐⭐⭐ | 🟡 Should-Do | Deterministic hashing, experiment layers, SRM detection, sequential testing |
+
+> **16** is the must-do — Kafka internals come up everywhere. 37, 40, 32 are strong should-dos for observability depth. 38, 39, 36 are overlapping variations.
+
+---
+
+### 💰 FinTech, Payments & Security
+
+| # | Problem | Difficulty | Priority | Core Concepts Learned |
+|---|---|---|---|---|
+| 73 | [Digital Wallet System](Top%2080%20Questions/73_Digital_Wallet_System.md) | ⭐⭐⭐ | 🟡 Should-Do | Double-entry ledger, SELECT FOR UPDATE, idempotent transfers, KYC |
+| 74 | [Fraud Detection System](Top%2080%20Questions/74_Fraud_Detection_System.md) | ⭐⭐⭐ | 🔴 Must-Do | Real-time feature store, ML ensemble, rule engine, fail-open/fail-close |
+| 75 | [Auth System (OAuth 2.0 / SSO)](Top%2080%20Questions/75_Auth_System_OAuth_SSO.md) | ⭐⭐⭐ | 🟡 Should-Do | JWT, refresh token rotation, PKCE, RBAC, credential stuffing defense |
+| 76 | [Stock Exchange Matching Engine](Top%2080%20Questions/76_Stock_Exchange_Matching_Engine.md) | ⭐⭐⭐ | 🟢 Bonus | Price-time priority, single-threaded matching, LMAX Disruptor, µs latency |
+| 77 | [Banking Ledger System](Top%2080%20Questions/77_Banking_Ledger_System.md) | ⭐⭐⭐ | 🟢 Bonus | Double-entry, immutable append-only, reversals, reconciliation |
+| 78 | [Multi-Currency Payment](Top%2080%20Questions/78_Multi_Currency_Payment.md) | ⭐⭐⭐ | 🟢 Bonus | FX rate locking, multi-currency ledger, payment routing |
+| 80 | [Content Moderation System](Top%2080%20Questions/80_Content_Moderation_System.md) | ⭐⭐⭐ | 🟡 Should-Do | Multi-modal ML pipeline, policy engine, human review queue, trust & safety |
+
+> **74** is the must-do — real-time ML scoring is a hot interview topic. 73, 75, 80 are strong should-dos. 76-78 are niche (FinTech/exchange-specific).
+
+---
+
+## 🔴 Must-Do List — 25 Problems That Cover Everything
+
+If you prepare only these, you'll have covered every major concept asked in system design interviews.
+
+| # | Problem | Category | What It Uniquely Teaches |
+|---|---|---|---|
+| 01 | URL Shortener | Infrastructure | Hashing, Base62, KGS, read-heavy design |
+| 02 | Rate Limiter | Infrastructure | Token bucket, sliding window, Redis Lua |
+| 03 | Key-Value Store | Infrastructure | LSM tree, WAL, replication, partitioning |
+| 04 | Unique ID Generator | Infrastructure | Snowflake, clock skew, k-sortable |
+| 05 | Notification System | Social/Real-Time | Multi-channel delivery, priority queues, templating |
+| 06 | News Feed System | Social/Real-Time | Fan-out on write/read, hybrid model, feed ranking |
+| 07 | Real-Time Chat | Social/Real-Time | WebSocket, message ordering, delivery receipts |
+| 12 | Search Engine | Search | Inverted index, BM25, PageRank, distributed search |
+| 13 | Web Crawler | Search | URL frontier, politeness, Bloom filter dedup |
+| 15 | Video Streaming | Media | HLS/DASH, adaptive bitrate, DRM |
+| 16 | Stream Processing | Analytics | Kafka internals, partitioning, windowing, exactly-once |
+| 17 | CDN | Media | Edge caching, PoP, Anycast, cache invalidation |
+| 19 | Ride-Hailing (Uber) | Geo/Location | Geospatial matching, real-time tracking, dispatch |
+| 20 | Proximity Server | Geo/Location | GeoHash, QuadTree, nearby search |
+| 23 | Ticketing System | E-Commerce | Race conditions, seat hold, TTL release |
+| 24 | Payment Gateway | E-Commerce | ACID, idempotency, double-entry ledger |
+| 25 | Dropbox / Google Drive | Media | File chunking, delta sync, conflict resolution |
+| 27 | Distributed Cache | Infrastructure | Consistent hashing, eviction, replication |
+| 28 | Job Scheduler | Infrastructure | Cron at scale, worker pools, idempotency |
+| 29 | Lock Manager | Infrastructure | Redlock, ZooKeeper, fencing tokens |
+| 30 | Load Balancer | Infrastructure | L4/L7, algorithms, health checks |
+| 31 | Distributed Queue | Infrastructure | Ordering, DLQ, exactly-once, backpressure |
+| 33 | Event Sourcing | Infrastructure | Event log, CQRS, snapshots, replay |
+| 41 | Like Count (High Profile) | Social | Sharded counters, Bloom filter, eventual consistency |
+| 47 | Recommendation System | Search/ML | Embeddings, ANN, candidate gen + ranking, feature store |
+| 74 | Fraud Detection | FinTech/ML | Real-time ML scoring, feature store, rule engine |
+
+### Concepts Fully Covered by the Must-Do Set
+
+✅ Caching (Redis, CDN, cache-aside, write-through)
+✅ Database choices (SQL vs NoSQL, when to use each)
+✅ Message queues & async processing (Kafka, SQS)
+✅ Real-time communication (WebSockets, SSE)
+✅ Search & indexing (inverted index, trie, Elasticsearch)
+✅ Geospatial (GeoHash, QuadTree, H3)
+✅ Consistency models (strong, eventual, causal)
+✅ Distributed coordination (locks, consensus, leader election)
+✅ Stream processing (Flink, windowing, exactly-once)
+✅ Rate limiting & throttling
+✅ Fan-out patterns (write vs read)
+✅ File storage & sync (chunking, delta)
+✅ Video/audio streaming (HLS, ABR, CDN)
+✅ ML ranking & recommendations
+✅ ACID transactions & idempotency
+✅ Race condition handling
+✅ Event sourcing & CQRS
+✅ Counter sharding at scale
+✅ Load balancing (L4/L7)
+✅ ID generation (Snowflake)
+
+---
+
+## 🟡 Should-Do List — 25 More for Depth
+
+These reinforce concepts from the must-do set with different problem shapes and add a few new patterns.
+
+| # | Problem | What It Adds Beyond Must-Do Set |
+|---|---|---|
+| 08 | Twitter Timeline | Trending (Count-Min Sketch), celebrity fan-out |
+| 09 | Instagram | Photo processing pipeline, CDN for media, feed ranking ML |
+| 10 | Reddit | Threaded comments (tree), hot/best ranking algorithms |
+| 11 | Typeahead | Trie data structure, prefix top-K, hot-swap |
+| 14 | Top K Rankings | Min-heap, approximate counting at scale |
+| 18 | Music Streaming | Audio codecs, offline mode, royalty tracking |
+| 21 | Food Delivery | Multi-party SAGA (customer/restaurant/driver), dispatch matching |
+| 22 | E-Commerce | Full microservice orchestration, catalog + search + cart + checkout |
+| 32 | Distributed Tracing | Span propagation, head-based vs tail-based sampling |
+| 34 | Live Likes & Reactions | High-throughput WebSocket broadcast, counter batching |
+| 37 | User Analytics Pipeline | Lambda architecture, batch + stream, data warehouse |
+| 40 | Log Aggregation | ELK stack, index lifecycle management, hot/warm/cold |
+| 42 | Trending Topics | Velocity-based scoring, sliding window aggregation |
+| 44 | TikTok | Interest-graph (not social-graph) feed, content embeddings |
+| 45 | Tinder | Geo + recommendation hybrid, swipe queue, mutual match race condition |
+| 49 | User Presence | Heartbeat protocol, fan-out to friends, status aggregation |
+| 50 | Social Graph Store | TAO-style cache, graph traversal, mutual friends |
+| 59 | Video Transcoding | DAG pipeline orchestration, GPU worker pools |
+| 60 | Live Streaming | RTMP→HLS, low-latency live, real-time transcoding |
+| 65 | Inventory Management | Two-phase stock reservation, multi-warehouse allocation |
+| 67 | Flash Sale System | Redis Lua scripts, virtual queue, extreme concurrency |
+| 68 | Order Management | SAGA with compensation, state machine, carrier integration |
+| 73 | Digital Wallet | Double-entry ledger, spending limits, P2P transfers |
+| 75 | Auth (OAuth/SSO) | JWT, PKCE, refresh rotation, credential stuffing defense |
+| 79 | A/B Testing | Deterministic hashing, experiment layers, SRM detection |
+| 80 | Content Moderation | Multi-modal ML pipeline (text/image/video), policy engine |
+
+---
+
+## 🟢 Bonus — 30 Remaining for Completeness
+
+These are niche, domain-specific, or overlapping with problems you've already studied. Useful for targeting specific companies or for comprehensive mastery.
+
+| # | Problem | Why It's Bonus |
+|---|---|---|
+| 26 | Pastebin | Simpler version of URL Shortener |
+| 35 | Live Comments | Similar to Live Likes (34) |
+| 36 | On-Call Escalation | Niche (PagerDuty-style), state machine already covered |
+| 38 | Metrics Aggregation | Overlaps with 37 (Analytics Pipeline) |
+| 39 | Real-Time Dashboard | Consumer of 37/38, WebSocket already covered |
+| 43 | Top K Shared Articles | Combines 14 (Top K) + 42 (Trending) |
+| 46 | Quora | Q&A variant of Reddit (10), Wilson score |
+| 48 | Ephemeral Stories | Subset of Instagram (09) with TTL |
+| 51 | Follower/Following | Subset of Social Graph (50) |
+| 52 | Mentions & Tagging | Autocomplete + notification fan-out, both covered |
+| 53 | Map Rendering | Niche (Google Maps), tile pyramid, A* routing |
+| 54 | Geofencing | Subset of Proximity Server (20) |
+| 55 | Foursquare | Variation of Proximity (20) + Social |
+| 56 | ETA Calculation | Niche (ML + graph), subset of Uber (19) |
+| 57 | Vehicle Tracking | GPS ingestion — subset of Uber (19) |
+| 58 | Bike Sharing | Niche (rebalancing, dock availability) |
+| 61 | Image Processing | Simpler version of Video Transcoding (59) |
+| 62 | Thumbnail Generation | Subset of Image Processing (61) |
+| 63 | Podcast Delivery | Simpler version of Music Streaming (18) |
+| 64 | Video Recommendation | Variation of Recommendation System (47) |
+| 66 | Shopping Cart | Simpler subset of E-Commerce (22) |
+| 69 | Review & Rating | Bayesian average, fake detection — standalone |
+| 70 | Price Comparison | NLP product matching, scraper architecture |
+| 71 | Coupon Engine | Rule engine, stacking — domain-specific |
+| 72 | Surge Pricing | H3 hexagons, supply/demand — niche (Uber-specific) |
+| 76 | Stock Exchange | Ultra-low latency, LMAX Disruptor — niche (FinTech) |
+| 77 | Banking Ledger | Double-entry, reconciliation — niche (FinTech) |
+| 78 | Multi-Currency Payment | FX locking, payment routing — niche (FinTech) |
+
+---
+
+## Study Paths by Company Type
+
+| Company Type | Focus On | Problems |
+|---|---|---|
+| **FAANG / Big Tech** | Core infra + social + search | 🔴 All Must-Do + 08, 09, 10, 44, 50 |
+| **Fintech (Stripe, Square)** | Payments + transactions + fraud | 23, 24, 67, 73, 74, 76, 77, 78 |
+| **Ride-Hailing / Logistics** | Geo + real-time + matching | 19, 20, 21, 45, 53, 56, 57, 72 |
+| **Streaming / Media** | Video + CDN + transcoding | 15, 17, 18, 25, 59, 60, 64 |
+| **E-Commerce** | Cart + inventory + orders | 22, 23, 24, 65, 66, 67, 68, 69, 71 |
+| **Observability / DevTools** | Logs + metrics + tracing | 16, 32, 37, 38, 39, 40, 79 |
+| **Social / Consumer** | Feed + chat + presence + graph | 06, 07, 08, 09, 34, 41, 44, 49, 50, 80 |
+
+---
+
+## 📚 Reference Books
+
+Available in the `Books/` folder:
+- System Design Interview – Alex Xu Vol 1 & Vol 2
+- ByteByteGo Big Archive 2023 & 2024
+- Grok System Design Interview
+
+---
+
+*80 problems · Structured solutions · Staff-engineer depth · Good luck! 🚀*
