@@ -1,4 +1,4 @@
-# 16. Design a Distributed Stream Processing System (Kafka)
+# 16. Design a Distributed Stream Processing System (Flink)
 
 ---
 
