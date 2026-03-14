@@ -1,0 +1,415 @@
+# 3. Design a Key-Value Store
+
+---
+
+## 1. Functional Requirements (FR)
+
+- `put(key, value)` — Store a key-value pair; overwrite if key exists
+- `get(key)` → value — Retrieve the value for a given key; return null if not found
+- `delete(key)` — Remove a key-value pair
+- Support keys up to 256 bytes, values up to 10 KB
+- Support versioning / conflict resolution (optional: last-write-wins or vector clocks)
+- Support TTL-based expiration on keys
+- Support range queries on keys (if ordered store)
+
+---
+
+## 2. Non-Functional Requirements (NFRs)
+
+- **High Availability**: AP system (prefer availability over consistency) — always writable
+- **Tunable Consistency**: Allow clients to choose (eventual, quorum, strong)
+- **Low Latency**: < 10 ms p99 for reads and writes
+- **Scalability**: Horizontal scaling — add nodes to increase capacity linearly
+- **Durability**: Data must survive node failures (replicated)
+- **Partition Tolerant**: System continues operating during network partitions
+- **Automatic failure detection and recovery**
+
+---
+
+## 3. Capacity Estimations
+
+| Metric | Value |
+|---|---|
+| Total key-value pairs | 1 billion |
+| Average key size | 100 bytes |
+| Average value size | 5 KB |
+| Storage per entry | ~5.1 KB |
+| Total data | 1B × 5.1 KB ≈ **5 TB** |
+| Replication factor 3 | **15 TB** total |
+| Writes/sec | 50K |
+| Reads/sec | 200K |
+| Nodes (if 1TB per node) | 15 nodes |
+
+---
+
+## 4. High-Level Design (HLD)
+
+```
+                              ┌──────────────┐
+                              │   Clients    │
+                              └──────┬──��────┘
+                                     │
+                              ┌──────▼───────┐
+                              │  Client Lib  │  ← Consistent hashing to find node
+                              │  / Coord.    │
+                              └──────┬───────┘
+                                     │
+           ┌─────────────────────────┼─────────────────────────┐
+           │                         │                         │
+    ┌──────▼──────┐          ┌──────▼──────┐          ┌──────▼──────┐
+    │   Node A    │          │   Node B    │          │   Node C    │
+    │ ┌─────────┐ │          │ ┌─────────┐ │          │ ┌─────────┐ │
+    │ │MemTable │ │          │ │MemTable │ │          │ │MemTable │ │
+    │ │ (sorted │ │          │ │         │ │          │ │         │ │
+    │ │  skiplist│ │          │ │         │ │          │ │         │ │
+    │ └────┬────┘ │          │ └────┬────┘ │          │ └────┬────┘ │
+    │ ┌────▼────┐ │          │ ┌────▼────┐ │          │ ┌────▼────┐ │
+    │ │  WAL    │ │          │ │  WAL    │ │          │ │  WAL    │ │
+    │ └────┬────┘ │          │ └────┬────┘ │          │ └────┬────┘ │
+    │ ┌────▼────┐ │          │ ┌────▼────┐ │          │ ┌────▼────┐ │
+    │ │SSTables │ │          │ │SSTables │ │          │ │SSTables │ │
+    │ │ (L0-LN) │ │          │ │ (L0-LN) │ │          │ │ (L0-LN) │ │
+    │ └─────────┘ │          │ └─────────┘ │          │ └─────────┘ │
+    └──────┬──────┘          └──────┬──────┘          └──────┬──────┘
+           │                         │                         │
+           └─────────────────────────┼─────────────────────────┘
+                                     │
+                              ┌──────▼───────┐
+                              │  Gossip      │  ← Failure detection + membership
+                              │  Protocol    │
+                              └──────────────┘
+```
+
+### Core Architecture Components
+
+#### Consistent Hashing with Virtual Nodes
+- **Why**: Distributes data evenly across nodes; adding/removing nodes only affects neighboring keys
+- **How**:
+  - Hash ring with 2^128 positions (MD5/SHA-256 of key)
+  - Each physical node owns multiple virtual nodes (150-200 vnodes)
+  - Key is placed on the ring → walk clockwise to find the first node → that's the coordinator
+  - Next N-1 distinct physical nodes clockwise are the replicas
+- **Why Virtual Nodes**: Without vnodes, data distribution is uneven. Vnodes ensure uniform distribution and smooth rebalancing when nodes join/leave
+
+#### Storage Engine — LSM Tree (Log-Structured Merge Tree)
+**Why LSM over B-Tree**: Optimized for write-heavy workloads (sequential disk writes)
+
+**Write Path**:
+1. Write to **WAL** (Write-Ahead Log) — append-only file for durability
+2. Write to **MemTable** — in-memory sorted data structure (Red-Black tree or Skip List)
+3. When MemTable reaches threshold (~64 MB) → flush to disk as an immutable **SSTable** (Sorted String Table)
+4. Background **compaction** merges SSTables to reduce read amplification
+
+**Read Path**:
+1. Check **MemTable** (most recent data)
+2. Check **Bloom Filter** for each SSTable (probabilistic: "definitely not here" or "maybe here")
+3. Check SSTables from newest to oldest
+4. Return first match found
+
+**Compaction Strategies**:
+- **Size-Tiered Compaction**: Good for write-heavy (Cassandra default). Merge similarly-sized SSTables
+- **Leveled Compaction**: Good for read-heavy. SSTables organized into levels; each level is 10× the previous
+
+#### Replication
+- **Replication Factor (N)**: Configurable, default 3
+- **Replication Strategy**: 
+  - Coordinator writes to N replicas
+  - Quorum-based: W + R > N ensures consistency
+    - W=2, R=2, N=3 → strong consistency
+    - W=1, R=1 → eventual consistency (fast)
+    - W=3, R=1 → write-heavy consistency
+
+#### Gossip Protocol (Failure Detection + Membership)
+- **Why**: Decentralized — no single point of failure (unlike Raft/Paxos leader)
+- **How**: Every node periodically (every 1 second) picks a random node and exchanges membership state
+- **Failure detection**: Uses **Phi Accrual Failure Detector** — calculates a suspicion level (phi) based on heartbeat intervals. Declares node dead when phi exceeds threshold (e.g., 8)
+- **Information propagated**: Node liveness, token ranges, load metrics
+
+#### Coordinator Node
+- **Role**: The node that receives the client request
+- **Write coordination**: Forwards write to all N replicas, waits for W acknowledgments
+- **Read coordination**: Sends read to all N replicas, waits for R responses, returns the one with the highest timestamp
+
+---
+
+## 5. APIs
+
+```
+put(key: bytes, value: bytes, context: Context) → void
+    context contains: version info (vector clock), consistency level
+
+get(key: bytes, consistency: Level) → {value: bytes, context: Context}
+    Returns value + metadata for conflict resolution
+
+delete(key: bytes, context: Context) → void
+    Actually writes a tombstone (deleted marker)
+```
+
+### Internal APIs
+```
+replicate(key, value, timestamp, vector_clock) → ack
+    Node-to-node replication
+
+handoff(key_range, data) → ack
+    Transfer data during node join/leave
+
+repair(key_range) → void
+    Anti-entropy repair: Merkle tree comparison
+```
+
+---
+
+## 6. Data Model
+
+### On-Disk SSTable Format
+
+```
+┌───────────────────────────────────────────┐
+│ Data Block 1                              │
+│  key1 | timestamp | value1                │
+│  key2 | timestamp | value2                │
+│  ...                                      │
+├───────────────────────────────────────────┤
+│ Data Block 2                              │
+│  ...                                      │
+├───────────────────────────────────────────┤
+│ Index Block (sparse index)                │
+│  key1 → offset_block1                     │
+│  key100 → offset_block2                   │
+├───────────────────────────────────────────┤
+│ Bloom Filter                              │
+├───────────────────────────────────────────┤
+│ Footer (metadata, version, compression)   │
+└───────────────────────────────────────────┘
+```
+
+### In-Memory MemTable
+```
+Data Structure: Skip List (O(log n) insert, lookup, range scan)
+Max Size: 64 MB
+On flush: Becomes immutable, new MemTable created
+```
+
+### WAL Entry Format
+```
+| CRC (4B) | Timestamp (8B) | Key Length (4B) | Value Length (4B) | Key | Value |
+```
+
+### Vector Clock (for conflict resolution)
+```json
+{
+  "key": "user:123:profile",
+  "value": "{name: 'Alice'}",
+  "vector_clock": {
+    "node_A": 3,
+    "node_B": 1,
+    "node_C": 2
+  },
+  "timestamp": 1710320000
+}
+```
+
+**Conflict Resolution**:
+- If one vector clock dominates the other → no conflict, take the dominant one
+- If concurrent (neither dominates) → return both to client, let application resolve (Amazon Dynamo approach)
+- Alternative: Last-Write-Wins (LWW) using timestamps — simpler but can lose data
+
+---
+
+## 7. Fault Tolerance
+
+### Core Mechanisms
+
+| Mechanism | How It Works |
+|---|---|
+| **Replication** | Each key stored on N=3 nodes. Survives up to N-1 simultaneous failures |
+| **WAL** | Every write is first logged to WAL before MemTable. On crash, replay WAL to recover MemTable |
+| **Hinted Handoff** | If a replica is down during write, coordinator stores a "hint" locally. When the replica recovers, the hint is forwarded |
+| **Anti-Entropy (Merkle Trees)** | Background process compares Merkle trees between replicas to detect and repair inconsistencies |
+| **Read Repair** | During a read, if replicas return different versions, coordinator sends the latest version to stale replicas |
+
+### Problem-Specific Fault Tolerance
+
+1. **Node Failure (Temporary)**
+   - Hinted Handoff ensures writes are not lost
+   - Gossip protocol detects failure and informs all nodes
+   - Reads still succeed from remaining replicas (if R ≤ remaining replicas)
+
+2. **Node Failure (Permanent)**
+   - Gossip declares node permanently dead after timeout
+   - Token reassignment: Virtual nodes of dead node are distributed to remaining nodes
+   - Data re-replicated from surviving replicas to maintain RF=3
+
+3. **Network Partition**
+   - AP system: Both sides of the partition continue accepting reads and writes
+   - Conflict resolution via vector clocks when partition heals
+   - Sloppy quorum: Write to any W available nodes (not necessarily the "correct" replicas)
+
+4. **Data Corruption**
+   - CRC checksums on every SSTable data block and WAL entry
+   - Detected during reads → repair from replica
+
+5. **Compaction Storms**
+   - Too many SSTables → background compaction consumes all I/O
+   - **Mitigation**: Rate-limit compaction I/O, prioritize user reads/writes, use leveled compaction
+
+---
+
+## 8. Additional Considerations
+
+### Merkle Trees for Anti-Entropy
+- Each node maintains a Merkle tree per key range
+- Leaf = hash of a key-value pair
+- Parent = hash of children
+- Two nodes compare root hashes → if different, recursively compare children to find divergent keys
+- Only divergent keys are synchronized → efficient bandwidth usage
+
+### Bloom Filters
+- One Bloom filter per SSTable
+- Before reading an SSTable from disk, check its Bloom filter
+- False positive rate ~1% with 10 bits per entry
+- Eliminates 99% of unnecessary disk reads
+
+### Tombstones and Garbage Collection
+- Deletes write a tombstone (marker) with a timestamp
+- Tombstones must persist for a grace period (e.g., 10 days) so all replicas learn about the delete
+- After grace period, compaction removes the tombstone
+
+### Hot Keys
+- If one key is extremely popular → one node becomes a bottleneck
+- **Solution**: Read from all replicas (load balance reads), add a cache layer in front
+
+### Tunable Consistency Examples
+| Config | Behavior | Use Case |
+|---|---|---|
+| W=1, R=1 | Fastest, eventual consistency | Session data, click tracking |
+| W=2, R=2, N=3 | Strong consistency | User profiles, inventory |
+| W=3, R=1 | Strong write, fast read | Write-once, read-many |
+| W=1, R=3 | Fast write, strong read | Logging with reliable reads |
+
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Why LSM-Tree Over B-Tree?
+
+| Factor | LSM-Tree (This Design) | B-Tree (MySQL/PostgreSQL) |
+|---|---|---|
+| **Write performance** | O(1) amortized (sequential append) | O(log N) per write (random I/O) |
+| **Read performance** | O(N) worst case (check multiple SSTables) | O(log N) guaranteed |
+| **Write amplification** | High (data rewritten during compaction) | Low (in-place updates) |
+| **Read amplification** | High (may check multiple levels) | Low (single tree traversal) |
+| **Space amplification** | Moderate (old versions during compaction) | Low (in-place updates) |
+| **Disk I/O pattern** | Sequential (HDD-friendly, SSD-excellent) | Random (SSD preferred) |
+
+**Why LSM wins for a KV store**: KV stores are typically write-heavy (ingesting events, session data, caches). The sequential write pattern of LSM trees achieves 10-100× higher write throughput compared to B-trees. The read penalty is mitigated by Bloom filters (eliminating 99% of false lookups) and the MemTable (most-recent data served from memory).
+
+**When B-Tree is better**: Read-heavy OLTP workloads with point queries and range scans where predictable read latency matters more than write throughput (e.g., relational databases).
+
+### CAP Theorem: Why AP Over CP?
+
+```
+This design chooses AP (Availability + Partition Tolerance):
+  → During a network partition, BOTH sides continue serving reads AND writes
+  → Conflicts are resolved after partition heals (vector clocks / LWW)
+
+Alternative CP choice (e.g., etcd, ZooKeeper):
+  → During partition, the minority side REJECTS writes
+  → Guarantees no conflicting writes, but reduces availability
+
+Why AP for a general-purpose KV store?
+  1. Most KV store use cases tolerate stale reads for seconds
+  2. Shopping cart, session data, user preferences → availability > consistency
+  3. Downtime costs more than temporary inconsistency
+  4. Conflict resolution (vector clocks) handles the rare actual conflicts
+  
+When CP is better:
+  → Configuration management (etcd), leader election, distributed locks
+  → Financial transactions, inventory counters
+  → Any case where "two different values for the same key" is unacceptable
+```
+
+### Vector Clocks vs Last-Write-Wins: The Conflict Resolution Trade-off
+
+```
+Vector Clocks (Dynamo approach):
+  ✓ No data loss — concurrent writes are BOTH preserved
+  ✓ Client chooses how to merge (application-aware resolution)
+  ✗ Vector clock size grows with number of writers (unbounded in theory)
+  ✗ Client must handle merge complexity
+  ✗ Garbage collection of old clock entries is tricky
+  
+  Mitigation: Truncate vector clock when it exceeds N entries (e.g., 10)
+              → Lose some causal tracking but bounds size
+  
+Last-Write-Wins (Cassandra approach):
+  ✓ Simple — highest timestamp wins, no client merge logic
+  ✓ Fixed-size metadata (just a timestamp)
+  ✗ LOSES data — concurrent writes, one is silently discarded
+  ✗ Depends on synchronized clocks (NTP)
+  ✗ Wall clock issues: clock skew can cause "future" writes to always win
+  
+  Mitigation: Use Hybrid Logical Clocks (HLC) instead of wall clock
+              → Combines wall clock + logical counter for causality without clock skew issues
+```
+
+**Recommendation**: For interview, discuss vector clocks (shows depth). In production, most systems use LWW (Cassandra) or CRDTs (Riak) because vector clocks' operational complexity is high.
+
+### Consistent Hashing: Why Virtual Nodes Are Essential
+
+```
+Without virtual nodes (3 physical nodes on the ring):
+  Node A: owns 60% of keys (unlucky hash distribution)
+  Node B: owns 25% of keys
+  Node C: owns 15% of keys
+  → Massively unbalanced! Node A is overloaded.
+
+With virtual nodes (each node has 200 vnodes):
+  Node A: 200 points on ring → ~33.3% of keys
+  Node B: 200 points on ring → ~33.3% of keys  
+  Node C: 200 points on ring → ~33.3% of keys
+  → Nearly perfectly balanced (law of large numbers)
+
+Additional benefit — heterogeneous hardware:
+  Beefy server with 32GB RAM → assign 300 vnodes
+  Small server with 8GB RAM → assign 75 vnodes
+  → Capacity-proportional data distribution
+  
+When a node DIES:
+  Without vnodes: ALL its data shifts to ONE neighbor → overload
+  With vnodes: Its 200 vnodes are spread across the ring → 
+               load spreads evenly across ALL surviving nodes
+```
+
+### Compaction Strategy: Size-Tiered vs Leveled
+
+| Factor | Size-Tiered (STCS) | Leveled (LCS) |
+|---|---|---|
+| **Write amplification** | Low (compact only similarly-sized files) | High (rewrite entire level on promotion) |
+| **Read amplification** | High (many overlapping SSTables to check) | Low (no overlap within a level) |
+| **Space amplification** | High (up to 2× during compaction) | Low (~10% overhead) |
+| **Best for** | Write-heavy, space-insensitive | Read-heavy, space-sensitive |
+
+**Decision**: Start with STCS (better write performance). If read latency becomes a problem (too many SSTables to check), switch to LCS. Many production deployments use STCS for recent data (high write rate) and LCS for older levels (optimize reads).
+
+### Sloppy Quorum vs Strict Quorum
+
+```
+Strict Quorum:
+  Write MUST go to the designated N replicas for this key
+  If 2 of 3 replicas are down → write FAILS
+  → Higher consistency, lower availability
+  
+Sloppy Quorum (this design):
+  Write goes to ANY W available nodes (even if they're not the "correct" replicas)
+  Temporarily stored on substitute nodes → "hinted handoff" when original recovers
+  → Higher availability, but data temporarily on wrong nodes
+  
+Trade-off:
+  Sloppy quorum during partition:
+    Client writes to nodes X, Y (substitutes) instead of A, B (correct replicas)
+    Read from node C (the only correct replica online) → MISS (data on X, Y!)
+    → Consistency violation until hinted handoff completes
+    
+  This is acceptable for AP systems where availability > consistency
+```
