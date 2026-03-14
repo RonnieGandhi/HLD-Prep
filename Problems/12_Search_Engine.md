@@ -304,3 +304,149 @@ Value:  {pagerank_score: 0.00042, last_computed: timestamp}
 - **Vector similarity search** (ANN: Approximate Nearest Neighbor) using FAISS or ScaNN
 - Hybrid: BM25 keyword matching + semantic similarity → combined score
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### End-to-End Query Execution Flow with Timing Budget
+
+```
+Query: "system design interview"
+Total budget: < 200 ms
+
+Step 1: Query Understanding (10 ms)
+  ├─ Tokenize: ["system", "design", "interview"]
+  ├─ Spell check: no corrections needed
+  ├─ Query expansion: + "system architecture interview" (synonym)
+  ├─ Intent classification: informational
+  └─ 10 ms total
+
+Step 2: Scatter to Index Shards (5 ms network)
+  ├─ Tier 0 index: 100 shards (top 1B pages, document-sharded)
+  ├─ Query coordinator broadcasts query to ALL 100 shards in parallel
+  ├─ Each shard receives query within ~5 ms (datacenter RTT)
+  └─ Timeout: 150 ms — if a shard doesn't respond, skip it
+
+Step 3: Per-Shard Processing (25 ms per shard, in parallel)
+  ├─ Each shard independently:
+  │   ├─ Posting list intersection: AND("system", "design", "interview")
+  │   │   Bloom filter: skip SSTables that definitely don't contain terms
+  │   │   Compressed posting lists: delta-decoded, PForDelta
+  │   │   Intersection: two-pointer merge on sorted doc_id lists → O(n+m)
+  │   │   → ~500 candidate docs on this shard (20 ms)
+  │   ├─ BM25 scoring: score all 500 candidates (3 ms)
+  │   ├─ Local top-K: priority queue → top 100 by BM25 score (2 ms)
+  │   └─ Return {doc_id, bm25_score, pagerank} × 100 to coordinator
+  └─ All 100 shards complete in ~25 ms (parallel)
+
+Step 4: Gather + Merge (5 ms)
+  ├─ Coordinator receives 100 × top-100 = 10,000 candidates
+  ├─ K-way merge using min-heap (size 100) → global top-1000
+  ├─ BM25 scores ARE globally comparable (IDF precomputed globally)
+  └─ 5 ms for merge
+
+Step 5: ML Re-ranking (50 ms)
+  ├─ Top 1,000 candidates → feature extraction (20 ms)
+  │   Features: BM25 score, PageRank, freshness, domain authority, 
+  │   historical CTR, BERT cross-encoder score (for top 200 only)
+  ├─ LambdaMART model inference: score all 1000 (15 ms)
+  ├─ Re-rank top 200 with BERT cross-encoder (expensive, 15 ms)
+  └─ Return top 50 after diversity/dedup
+
+Step 6: Snippet Generation (10 ms)
+  ├─ For top 10 results: fetch document content from Document Store
+  ├─ Find best passage (highest query term density)
+  ├─ Highlight matching terms: <b>system design</b> <b>interview</b>
+  └─ Truncate to ~160 chars
+
+Step 7: Response Assembly (5 ms)
+  ├─ Add related searches, knowledge panel (if entity match)
+  ├─ Serialize JSON response
+  └─ Return to client
+
+TOTAL: 10 + 5 + 25 + 5 + 50 + 10 + 5 = 110 ms (within 200ms budget)
+```
+
+### Scatter-Gather: Index Shard Coordination
+
+```
+Architecture:
+  Query Coordinator (stateless, horizontally scaled)
+      │
+      ├──→ Shard 1 (docs 0-10M)
+      ├──→ Shard 2 (docs 10M-20M)
+      ├──→ ...
+      └──→ Shard 100 (docs 990M-1B)
+
+Handling slow shards (the tail latency problem):
+  
+  At 100 shards, p99 latency of any SINGLE shard ≈ p50 × 3-5×
+  P(at least one shard is slow) = 1 - (1-0.01)^100 = 63%
+  → Most queries would hit the 200ms deadline waiting for one slow shard
+  
+  Solutions:
+  
+  1. Hedged Requests ⭐
+     Send query to primary shard AND its replica
+     Wait 30ms → if primary hasn't responded, send to replica
+     Use whichever responds first, cancel the other
+     Trade-off: 2× more requests (~5% of the time) → much lower tail latency
+  
+  2. Speculative Execution
+     After 100ms, if 95/100 shards responded, return results from 95 shards
+     Missing 5% of documents is acceptable (small quality loss)
+     Users never notice 5% fewer candidates
+  
+  3. Index Tiers (already in design)
+     Tier 0 (top 1B pages): 100 shards, always searched
+     Only search Tier 1 (10B pages) if Tier 0 returns < 100 results
+     80%+ of queries are fully served by Tier 0
+     Avoids querying 1000+ Tier 2 shards except for rare queries
+
+Shard routing:
+  Document-sharded: each shard holds ALL terms for its document subset
+  Query goes to EVERY shard → fan-out is fixed (100 RPCs)
+  Alternative: Term-sharded (shard A has terms A-M, shard B has N-Z)
+    Query "system design" needs shards for 's' AND 'd' → only 2 RPCs
+    BUT: cross-shard join is expensive, uneven (some terms are huge)
+  Google uses document-sharding — simpler, more uniform
+```
+
+### Result Merging Across Document Shards
+
+```
+Problem: Each shard computes BM25 scores locally. Are they comparable?
+
+BM25 depends on global corpus statistics:
+  IDF(qi) = log((N - n(qi) + 0.5) / (n(qi) + 0.5))
+  N = total documents in corpus
+  n(qi) = documents containing term qi
+
+Solution: Global IDF, precomputed during index build
+  During index construction (MapReduce):
+    1. Count total documents N (across ALL shards)
+    2. Count document frequency n(qi) for each term (across ALL shards)
+    3. Compute IDF for each term
+    4. Store IDF values in each shard's term dictionary
+  
+  At query time: each shard uses the SAME global IDF values
+  → BM25 scores are globally comparable ✓
+  → K-way merge produces correct global top-K
+
+K-way merge algorithm:
+  100 shards, each returns top-100 sorted by score DESC
+  
+  1. Create min-heap of size 100 (one entry per shard)
+  2. Insert first result from each shard → heap has 100 entries
+  3. Pop max → this is global #1 result
+  4. Push next result from that shard
+  5. Repeat until top-K extracted
+  
+  Time: O(K × log(num_shards)) = O(1000 × log(100)) ≈ 7000 comparisons
+  Tie-breaking: if BM25 scores equal, use PageRank as secondary sort
+
+Edge case: same document on multiple shards?
+  With document-sharding: impossible (each doc on exactly one shard)
+  With near-duplicate detection (SimHash): dedup in re-ranking stage
+```
+

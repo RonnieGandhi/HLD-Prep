@@ -250,3 +250,167 @@ Search ranking demonstrates understanding of:
 Commonly asked at: Google, Microsoft (Bing), Amazon, Pinterest, LinkedIn
 ```
 
+---
+
+## 8. Deep Dive: Feature Store Architecture
+
+### Training-Serving Skew — The Silent Killer
+
+```
+The Problem:
+  Training: Spark job reads features from S3/Parquet (computed yesterday)
+  Serving: Feature Service reads features from Redis (computed 5 minutes ago)
+  
+  If training and serving use DIFFERENT feature computation code → the model
+  sees features at serve time that don't match what it was trained on → 
+  accuracy degrades silently (no error, just wrong predictions)
+
+  Example: Training computes "user_click_count_7d" with timezone UTC.
+           Serving computes it with timezone PST. Off by 8 hours of data.
+           Model never saw this version → predictions are subtly wrong.
+```
+
+### Feature Store Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   SHARED FEATURE DEFINITIONS                     │
+│  features.yaml:                                                  │
+│    user_click_count_7d:                                         │
+│      type: INT                                                   │
+│      source: click_logs                                         │
+│      window: 7 days                                              │
+│      aggregation: COUNT                                          │
+│      version: 3                                                  │
+│                                                                  │
+│  ONE definition → generates BOTH batch (training) and           │
+│  streaming (serving) computation code → no skew                  │
+└───────────────────┬─────────────────────┬───────────────────────┘
+                    │                     │
+        ┌───────────▼─────────┐  ┌────────▼──────────────┐
+        │  OFFLINE STORE      │  │  ONLINE STORE          │
+        │  (Training)         │  │  (Serving)             │
+        │                     │  │                        │
+        │  Spark batch job    │  │  Flink streaming job   │
+        │  → Parquet on S3    │  │  → Redis/DynamoDB     │
+        │                     │  │                        │
+        │  Point-in-time join:│  │  Lookup: < 2ms        │
+        │  Feature values AS  │  │  Features reflect     │
+        │  OF the impression  │  │  latest data          │
+        │  timestamp (prevents│  │                        │
+        │  data leakage)      │  │                        │
+        └─────────────────────┘  └────────────────────────┘
+
+Point-in-time join (critical for training correctness):
+  Impression at T=10:00 AM → features must be AS OF 10:00 AM
+  NOT features as of today (that would include future data → leakage)
+  
+  Implementation: Feature Store logs every feature update with timestamp
+    At training time: for each impression, look up feature values with
+    timestamp <= impression_timestamp → time-travel query
+```
+
+---
+
+## 9. Model Deployment Pipeline
+
+```
+Stage 1: OFFLINE EVALUATION
+  Train new model (challenger) on latest data
+  Evaluate on holdout set:
+    NDCG@10 improved by ≥ 0.5%? 
+    Latency p99 ≤ 150ms?
+    No regression on any query category?
+  If YES → proceed. If NO → stop, investigate.
+
+Stage 2: SHADOW MODE (1-3 days)
+  Deploy challenger alongside champion
+  Both models score EVERY query
+  Only champion's results are shown to users
+  Challenger's results are logged for offline comparison
+  Compare: predicted NDCG, latency distribution, error rates
+  No user impact — pure observation
+
+Stage 3: INTERLEAVING EXPERIMENT (3-7 days)
+  Mix results from champion and challenger in the same SERP
+  Odd positions: champion's results. Even positions: challenger's.
+  Measure: which model's results get more clicks (team-draft interleaving)
+  
+  Why interleaving > A/B test for search?
+    A/B test: 50% users see champion, 50% see challenger
+    Problem: query distribution differs between groups → noisy
+    Interleaving: same user, same query, both models → direct comparison
+    Needs 10× fewer queries to reach statistical significance
+
+Stage 4: CANARY (1% traffic, 2-3 days)
+  1% of real traffic served by challenger exclusively
+  Monitor: NDCG, CTR@1, abandonment rate, latency p99
+  Automated rollback trigger:
+    NDCG drops > 1% → auto-rollback within 5 minutes
+    Latency p99 > 200ms → auto-rollback
+    Error rate > 0.1% → auto-rollback
+
+Stage 5: GRADUAL RAMP (1-2 weeks)
+  1% → 5% → 25% → 50% → 100%
+  Each step: 2-day bake time with monitoring
+  At 100%: champion retires, challenger becomes new champion
+
+Rollback at any stage:
+  Config change in model registry → takes effect in < 60 seconds
+  Both models always loaded in memory on serving hosts → instant switch
+```
+
+---
+
+## 10. NDCG — Worked Example
+
+```
+Query: "best noise cancelling headphones"
+5 results returned, with human relevance judgments (0-4 scale):
+
+  Position 1: Result A → relevance = 3 (highly relevant)
+  Position 2: Result B → relevance = 2 (relevant)
+  Position 3: Result C → relevance = 0 (irrelevant)
+  Position 4: Result D → relevance = 1 (slightly relevant)
+  Position 5: Result E → relevance = 0 (irrelevant)
+
+Step 1: Compute DCG (Discounted Cumulative Gain)
+  DCG = Σ (2^rel_i - 1) / log₂(i + 1)
+  
+  Position 1: (2³ - 1) / log₂(2) = 7 / 1.0   = 7.000
+  Position 2: (2² - 1) / log₂(3) = 3 / 1.585  = 1.893
+  Position 3: (2⁰ - 1) / log₂(4) = 0 / 2.0    = 0.000
+  Position 4: (2¹ - 1) / log₂(5) = 1 / 2.322  = 0.431
+  Position 5: (2⁰ - 1) / log₂(6) = 0 / 2.585  = 0.000
+  
+  DCG@5 = 7.000 + 1.893 + 0.000 + 0.431 + 0.000 = 9.324
+
+Step 2: Compute IDCG (Ideal DCG — perfect ranking)
+  Ideal order by relevance: [3, 2, 1, 0, 0]
+  
+  Position 1: 7 / 1.0   = 7.000
+  Position 2: 3 / 1.585 = 1.893
+  Position 3: 1 / 2.0   = 0.500
+  Position 4: 0 / 2.322 = 0.000
+  Position 5: 0 / 2.585 = 0.000
+  
+  IDCG@5 = 7.000 + 1.893 + 0.500 + 0.000 + 0.000 = 9.393
+
+Step 3: NDCG = DCG / IDCG = 9.324 / 9.393 = 0.993
+
+Interpretation: 0.993 is close to perfect (1.0). The only mistake is
+  Result D (relevance=1) at position 4 instead of position 3.
+
+Now swap Results C and D (fix the one mistake):
+  New order: [3, 2, 1, 0, 0] → NDCG = 1.000 (perfect)
+
+LambdaMART intuition:
+  The "lambda" for swapping C and D = ΔNDCG = 1.000 - 0.993 = 0.007
+  This small gradient pushes the model to rank D above C
+  For a bigger relevance gap (e.g., swapping rel=3 and rel=0), 
+  the lambda would be much larger → stronger gradient signal
+  
+  This is why LambdaMART directly optimizes NDCG: the training
+  gradients ARE the NDCG changes from pairwise swaps
+```
+

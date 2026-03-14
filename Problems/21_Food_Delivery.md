@@ -384,3 +384,173 @@ Real-time constraints:
   Dasher preferences: some dashers prefer short trips → soft constraint
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Race Conditions in Dispatch
+
+```
+Scenario: Two dispatch workers process different orders simultaneously.
+  Both score Dasher X as the best candidate for their respective orders.
+  Both attempt to assign Dasher X → one order gets the dasher, other waits.
+
+Solution 1: Distributed Lock (Redis SETNX) ⭐
+  Before sending dispatch request:
+    SET dasher:lock:{dasher_id} {order_id} NX EX 30
+    NX = only if not exists (atomic)
+    EX = expires in 30 seconds (prevents deadlock on crash)
+  
+  If SET succeeds → we "own" this dasher → send dispatch request
+  If SET fails → dasher already assigned → try next candidate
+  On dasher accept/decline → release lock
+  
+  ✓ Simple, fast (< 1ms Redis call)
+  ✗ False exclusion: dasher locked for 30s even if first order is declined
+  Mitigation: 15-second accept window + immediate lock release on decline
+
+Solution 2: Optimistic Concurrency in DB
+  UPDATE dashers 
+  SET current_order_count = current_order_count + 1, 
+      version = version + 1
+  WHERE dasher_id = ? AND current_order_count < 2 AND version = ?
+  
+  If rows_affected = 1 → success (dasher assigned)
+  If rows_affected = 0 → concurrent assignment happened → retry with next dasher
+  
+  ✓ No external lock service
+  ✗ Higher latency than Redis (DB round-trip)
+
+Solution 3: Centralized Dispatch Queue per Zone ⭐⭐
+  Partition city into zones (e.g., H3 resolution-7 hexagons)
+  Each zone has ONE dispatch worker (single-writer)
+  Worker consumes orders from Kafka partition for that zone
+  Single-threaded per zone → NO race conditions by design
+  
+  ✓ Zero lock contention
+  ✓ Can do batch optimization (collect orders for 5 seconds, then assign)
+  ✗ Zone boundary: order near boundary might miss dashers in adjacent zone
+  Mitigation: zones overlap by 1 km; dispatch worker checks neighboring zones
+
+Recommended: Solution 3 for production (DoorDash's actual approach),
+             Solution 1 for simpler deployments
+```
+
+### Order State Machine Failure Scenarios
+
+```
+Scenario 1: Restaurant tablet goes offline after CONFIRMED
+  Detection: No heartbeat from tablet for 2 minutes
+  Action:
+    T+2min: Send SMS to restaurant phone number
+    T+5min: Auto-call restaurant landline (IVR: "Press 1 to confirm order")
+    T+8min: If still no response → auto-cancel order
+    → Compensate: refund customer, release dasher assignment
+    → Notify customer: "Restaurant unreachable, order cancelled. Here are similar restaurants."
+  
+  Edge case: Restaurant was preparing food but tablet died
+    → When tablet reconnects, check if order was auto-cancelled
+    → If food was prepared → restaurant eats the cost (SLA violation)
+    → Platform may compensate restaurant for confirmed-then-cancelled orders
+
+Scenario 2: Dasher app crashes during PICKED_UP
+  Detection: No GPS heartbeat for 3 minutes
+  Action:
+    T+3min: Send push notification + SMS to dasher
+    T+5min: Call dasher's phone
+    T+8min: If unreachable → reassign to new dasher
+    → Challenge: new dasher doesn't have the food!
+    → If dasher had the food and went offline → customer gets refund
+    → If dasher reconnects → resume delivery (update ETA)
+  
+  Prevention: "Proof of pickup" — dasher confirms pickup code from restaurant
+    → System knows food was picked up → different handling than pre-pickup crash
+
+Scenario 3: Payment capture fails after delivery
+  Flow: Payment authorized at order placement, captured on delivery confirmation
+  If capture fails (expired card, bank decline):
+    → Retry capture 3 times with exponential backoff
+    → If all retries fail → queue for manual payment recovery
+    → Restaurant and dasher STILL get paid (platform absorbs the loss)
+    → Never re-charge customer for same order (idempotency_key on capture)
+    → Flag customer account for future orders (require upfront payment)
+
+Scenario 4: Customer cancels after food is being prepared (PREPARING state)
+  Cancellation policy based on state:
+    PLACED (not confirmed):     Full refund, no penalty
+    CONFIRMED (not preparing):  Full refund, restaurant gets small fee ($2)
+    PREPARING:                  Partial refund (50%), restaurant keeps food cost
+    READY / PICKED_UP:          No refund (food is ready, dasher is en route)
+  
+  Who pays for the food?
+    Platform absorbs cost for CONFIRMED cancellations (acquisition cost)
+    Customer pays for PREPARING+ cancellations (food already in progress)
+    Restaurant always receives payment for food they've started preparing
+```
+
+### Real-Time Tracking Data Flow
+
+```
+Dasher App → Customer App: live location on map
+
+  Dasher App                                              Customer App
+      │                                                        │
+      │ GPS every 4 seconds (adaptive — see below)             │
+      │                                                        │
+      ├──→ API Gateway                                         │
+      │       │                                                │
+      │    ┌──▼────────────┐                                   │
+      │    │ Kafka topic:  │ partitioned by dasher_id          │
+      │    │ dasher-        │ (ensures ordering per dasher)     │
+      │    │ locations     │                                    │
+      │    └──┬────────────┘                                   │
+      │       │                                                │
+      │    ┌──▼────────────┐                                   │
+      │    │ Flink consumer│                                   │
+      │    │ (or Go worker)│                                   │
+      │    │               │                                   │
+      │    │ 1. Update Redis GEOADD (for dispatch matching)   │
+      │    │ 2. Map-snap GPS to nearest road segment          │
+      │    │ 3. Kalman filter: smooth GPS jitter              │
+      │    │ 4. Write to Cassandra (trip location trail)       │
+      │    │ 5. Publish to Redis Pub/Sub channel:              │
+      │    │    "tracking:{order_id}"                          │
+      │    └──┬────────────┘                                   │
+      │       │                                                │
+      │    ┌──▼────────────┐                                   │
+      │    │ Tracking      │ ← Customer's WebSocket connects   │
+      │    │ Service       │    here when viewing order status  │
+      │    │               │                                   │
+      │    │ Subscribes to │                                   │
+      │    │ Redis Pub/Sub │──── WebSocket push ──────────────→│
+      │    │ "tracking:    │    { lat, lng, heading, eta }     │
+      │    │  {order_id}"  │                                   │
+      │    └───────────────┘                                   │
+
+GPS optimization (adaptive frequency):
+  Dasher stationary (speed=0):        Update every 30 seconds (save battery)
+  Dasher walking to restaurant (<5km/h): Update every 10 seconds
+  Dasher driving (>10 km/h):          Update every 4 seconds
+  Dasher approaching customer (<500m): Update every 2 seconds (precise ETA)
+
+GPS jitter handling (Kalman filter):
+  Raw GPS has ±10-30m error. Without filtering:
+    Map shows dasher "jumping" between buildings, crossing rivers
+  
+  Kalman filter: predict next position from velocity + heading,
+    then correct with actual GPS reading. Weight prediction more
+    when GPS signal is weak (indoors, urban canyon).
+  
+  Map snapping: after Kalman, snap to nearest road segment
+    using a road network graph (OpenStreetMap / Google Roads API).
+    Dasher always appears ON a road, moving smoothly.
+
+ETA update during delivery:
+  Not just "distance ÷ speed" — consider:
+    Remaining route distance (via routing engine, not straight line)
+    Real-time traffic on route segments
+    Typical time to park + walk to door at this address
+    Buffer: 2-3 min for elevator, apartment navigation
+  Recalculated every 30 seconds as dasher moves
+```
+

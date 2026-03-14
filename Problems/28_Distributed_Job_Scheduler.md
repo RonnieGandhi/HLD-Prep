@@ -386,3 +386,202 @@ Implementation:
 - **Dead letter queue size** (alert if growing)
 - **Missed jobs** (scheduled time passed without execution — most critical alert)
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### End-to-End Job Execution Flow
+
+```
+Job: "Send welcome email to user-123 at 2026-03-14T15:00:00Z"
+
+T-60min (submission):
+  1. Client POST /api/v1/jobs → API Gateway → Job Service
+  2. Job Service validates: payload, execute_at in future, idempotency_key unique
+  3. Write to PostgreSQL: INSERT INTO jobs (status='scheduled', execute_at=...)
+  4. Compute timer bucket: bucket = floor(execute_at / 60) = 2026-03-14T15:00
+  5. Insert into Redis sorted set:
+     ZADD timer:bucket:1710428400 1710428400 "job-uuid"
+  6. Return 201 Created to client
+
+T-0 (execution time arrives):
+  7. Schedule Manager (leader) polls current bucket every 1 second:
+     ZRANGEBYSCORE timer:bucket:1710428400 0 {now} LIMIT 0 100
+  8. Found "job-uuid" → atomically remove from sorted set:
+     ZREM timer:bucket:1710428400 "job-uuid"
+     (If ZREM returns 0 → another scheduler already took it → skip)
+  9. Acquire distributed lock: SET job:dispatch:job-uuid 1 NX EX 60
+  10. Update PostgreSQL: status = 'dispatched'
+  11. Publish to Kafka topic 'jobs.normal' with job payload
+
+T+0.1s (worker picks up):
+  12. Worker consumes from Kafka
+  13. Worker acquires execution lock: SET job:exec:job-uuid {worker-id} NX EX 300
+  14. Worker checks DB: status should be 'dispatched' (idempotency check)
+  15. Update status = 'running', started_at = now()
+  16. Execute: call email service POST /api/send-email
+  17. On success: update status = 'completed', completed_at = now()
+  18. Release lock: DEL job:exec:job-uuid
+  19. If callback_url configured: POST result to callback URL
+
+Total latency: execute_at to job start: ~100-500ms
+```
+
+### Race Conditions in Job Scheduling
+
+```
+Race 1: Duplicate Dispatch (two schedulers grab same job)
+
+  Scheduler A and B are both active (split-brain during leader election,
+  or intentional multi-scheduler for throughput):
+  
+  Scheduler A: ZRANGEBYSCORE → finds job-123
+  Scheduler B: ZRANGEBYSCORE → finds job-123 (same scan)
+  
+  Both try to dispatch → duplicate execution!
+  
+  Solution: Atomic claim with ZREM
+    result = ZREM timer:bucket:X job-123
+    If result = 1 → I claimed it → dispatch
+    If result = 0 → someone else claimed it → skip
+    
+    ZREM is atomic in Redis → only ONE scheduler succeeds
+    No distributed lock needed for this step
+  
+  Additional safety: distributed lock on dispatch
+    SET job:dispatch:job-123 1 NX EX 60
+    Even if ZREM race happens (extremely unlikely), lock prevents double dispatch
+
+Race 2: Timer Bucket Boundary Problem
+
+  Job scheduled at 15:00:59.900 (near bucket boundary)
+  Bucket for 15:00 scanned at 15:00:59.500 → job NOT YET DUE
+  Bucket for 15:01 scanned at 15:01:00.500 → but job is in 15:00 bucket!
+  
+  Job falls through the crack — never executed!
+  
+  Solution: Scanner always checks CURRENT bucket AND PREVIOUS bucket
+    current_bucket = floor(now / 60)
+    prev_bucket = current_bucket - 60
+    Scan both: timer:bucket:{current} AND timer:bucket:{prev}
+    
+    This ensures no job is missed at bucket boundaries
+    Previous bucket may have stragglers that just became due
+
+Race 3: Worker Crash After Processing But Before Status Update
+
+  Worker executes email → success
+  Worker crashes before UPDATE status = 'completed'
+  Worker lock expires → job re-dispatched → email sent AGAIN
+  
+  Solution: Idempotent execution
+    Email service deduplicates by idempotency_key
+    Worker sends: POST /send-email with Idempotency-Key: job-uuid
+    If already sent → email service returns 200 (cached response)
+    
+  Alternative: Two-phase completion
+    Worker writes to outbox table (same DB as status update, atomic)
+    Background process reads outbox → calls email service
+    If email service fails → retry from outbox
+    If worker crashes → outbox entry not written → job re-dispatched → correct
+```
+
+### Scaling Timer Buckets
+
+```
+Problem: 100M scheduled jobs → Redis sorted set becomes massive
+  Single ZRANGEBYSCORE on 100M entries → slow
+
+Sharding strategy:
+  Shard timer buckets by time range across multiple Redis instances:
+    Shard 0: buckets for minutes 0-14 of each hour
+    Shard 1: buckets for minutes 15-29
+    Shard 2: buckets for minutes 30-44
+    Shard 3: buckets for minutes 45-59
+  
+  Each shard holds ~25M jobs → manageable
+  At any given minute, only ONE shard is actively scanned
+  
+  Alternative: Shard by job_id hash
+    ZADD timer:bucket:{minute}:{hash(job_id) % 16} {ts} {job_id}
+    16 sub-buckets per minute → parallelizable scanning
+    Each scanner instance handles a subset of sub-buckets
+
+Multi-scheduler architecture:
+  Run N scheduler instances, each responsible for a subset of buckets
+  Partition assignment via consistent hashing or ZooKeeper
+  Each scheduler: claim a time range → scan only its buckets
+  Leader handles partition assignment + rebalancing on scheduler failure
+```
+
+### Timer Approaches: Sorted Set vs Timing Wheel vs DB Polling
+
+```
+Redis Sorted Set (this design):
+  Insert: O(log N) — ZADD
+  Scan due: O(log N + M) — ZRANGEBYSCORE for M due items
+  Memory: all jobs in Redis RAM
+  ✓ Simple, fast, well-understood
+  ✗ Memory-bound: 100M × 200 bytes = 20 GB in Redis
+  ✗ Redis becomes SPOF for scheduling
+  Best for: < 50M scheduled jobs
+
+Hierarchical Timing Wheel (Kafka, Netty):
+  Structure: circular array at each level (seconds, minutes, hours)
+  Insert: O(1) — place in correct wheel slot
+  Fire: O(1) amortized — current slot fires, cascade from higher wheels
+  ✓ O(1) operations, extremely efficient
+  ✗ Complex to implement correctly
+  ✗ Must be in-process (not easily distributed)
+  Best for: In-process timers (network timeouts, connection keepalive)
+
+Database Polling (simplest):
+  SELECT * FROM jobs WHERE execute_at <= NOW() AND status = 'scheduled'
+  LIMIT 100 FOR UPDATE SKIP LOCKED
+  ✓ No Redis dependency
+  ✓ PostgreSQL handles durability and locking
+  ✗ Polling every second on large table → index pressure
+  ✗ Higher latency (up to 1 second polling interval)
+  Best for: < 1M jobs, or as fallback when Redis is down
+
+Hybrid (recommended at scale):
+  Redis sorted set for next-24-hour jobs (hot jobs, fast scan)
+  PostgreSQL for jobs > 24 hours away (cold jobs, large volume)
+  Daily migration: move tomorrow's jobs from PG → Redis
+  Fallback: if Redis down → DB polling with SKIP LOCKED
+```
+
+### At-Most-Once vs At-Least-Once vs Exactly-Once Execution
+
+```
+At-Most-Once:
+  Dispatch job, delete from timer, don't track completion
+  If worker crashes → job lost (never retried)
+  ✓ Simple
+  ✗ Silent job loss — unacceptable for important work
+  Use case: Non-critical analytics, optional notifications
+
+At-Least-Once (this design):
+  Dispatch job, track status, retry on failure/timeout
+  If worker crashes after execution but before ACK → re-executed
+  ✓ No job loss
+  ✗ May execute twice → workers MUST be idempotent
+  Use case: Most jobs (email, webhook, data processing)
+
+Exactly-Once (hardest):
+  Requires transactional processing:
+    1. Read job from Kafka in a transaction
+    2. Execute job
+    3. Commit Kafka offset + write result to DB atomically
+  Only possible if job result and offset commit are in same DB
+  ✓ Perfect deduplication
+  ✗ Complex, tight coupling between queue and result store
+  Use case: Financial operations, inventory updates
+  
+  Practical exactly-once: at-least-once + idempotent workers
+    Worker checks: "have I processed job-uuid before?"
+    If yes → return cached result
+    If no → process, store result with job-uuid as key
+    This is simpler than transactional exactly-once and works in practice
+```
+

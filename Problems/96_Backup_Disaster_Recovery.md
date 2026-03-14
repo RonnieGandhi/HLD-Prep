@@ -344,3 +344,178 @@ Crypto-shredding:
 - **Backup bandwidth**: 500TB backup over network = days. Use incremental (25TB/day) + local snapshot + async replication
 - **Monitoring**: Track backup success rate, backup size trends (sudden growth = anomaly), replication lag, last successful restore test date
 
+---
+
+## 10. Deep Dive: Engineering Trade-offs
+
+### RPO vs RTO: The Fundamental Trade-off
+
+```
+RPO = how much data you can afford to lose
+RTO = how long you can be down
+
+RPO 0 (zero data loss):
+  Requires: synchronous replication to DR site
+  Sync replication: primary WAITS for DR to confirm write before ACK to client
+  Latency cost: +20-100ms per write (cross-region network RTT)
+  ✗ 2-5× slower writes than async
+  ✓ Zero data loss guaranteed
+  Use for: Financial transactions, ledger systems, payment data
+
+RPO 1 minute:
+  Requires: async replication + WAL shipping every minute
+  Primary writes freely → ships WAL logs to DR every 60 seconds
+  On failover: lose up to 60 seconds of committed transactions
+  ✓ Minimal write performance impact
+  ✗ 1 minute of data loss on catastrophic failure
+  Use for: E-commerce orders, user data, content
+
+RPO 1 hour:
+  Requires: hourly backups to S3 (snapshot + incremental)
+  Cheapest approach — no replication, just scheduled backups
+  On failover: restore from last backup → 1 hour of data loss
+  ✓ Simple, cheap
+  ✗ Significant data loss + slow restore (RTO = hours)
+  Use for: Analytics, non-critical data, development environments
+
+RTO → cost relationship:
+  RTO = 4 hours: weekly full + daily incremental. Restore from backup.
+    Cost: ~$500/month (just S3 storage)
+  RTO = 15 minutes: hot standby + automated failover
+    Cost: ~$10,000/month (duplicate infrastructure, always running)
+  RTO = 30 seconds: active-active multi-region
+    Cost: ~$50,000/month (full infrastructure in 2+ regions)
+  
+  Each 10× improvement in RTO → ~5-10× cost increase
+```
+
+### Split-Brain Prevention During Failover
+
+```
+The most dangerous failure mode in DR:
+
+  Both primary and DR think they are the active writer
+  → Two databases accepting writes independently
+  → Data diverges → reconciliation is extremely hard (or impossible)
+  → Financial data corruption → regulatory and legal exposure
+
+How split-brain happens:
+  Primary: us-east-1 (healthy, accepting writes)
+  DR:      us-west-2 (standby, read-only)
+  
+  Monitoring detects: "primary appears down" (false alarm — network issue)
+  Automated failover promotes DR to primary
+  Old primary is actually fine → now BOTH accept writes → SPLIT BRAIN
+  
+Prevention strategies:
+
+  1. Fencing (STONITH — Shoot The Other Node In The Head):
+     Before promoting DR:
+       a. Revoke primary's IAM write permissions
+       b. Modify security group: block all client traffic to primary
+       c. Shut down primary DB process via out-of-band management (IPMI/ILO)
+     Only AFTER fencing succeeds → promote DR
+     If fencing fails → DO NOT promote (manual intervention required)
+  
+  2. Witness/Quorum:
+     Deploy a "witness" node in a third region (e.g., us-central-1)
+     Failover decision requires agreement from 2-of-3: primary, DR, witness
+     If primary is truly down: DR + witness agree → promote
+     If network partition: primary + witness agree → primary stays active
+     Prevents: monitoring false alarms from triggering split-brain
+  
+  3. Lease-based leadership:
+     Primary holds a "leadership lease" in a distributed lock (DynamoDB/etcd)
+     Lease expires every 30 seconds → primary must renew
+     If primary can't renew (network partition) → lease expires → safe to promote
+     Primary detects lease loss → SELF-FENCES (stops accepting writes)
+     
+     This is how AWS RDS multi-AZ failover works internally
+
+  4. Epoch-based writes:
+     Every write includes an epoch number
+     On failover: new primary increments epoch (42 → 43)
+     Old primary still at epoch 42
+     Storage layer rejects writes with epoch < current (42 < 43 → rejected)
+     Even if old primary briefly accepts writes → they're discarded downstream
+```
+
+### Failback: Returning to Primary After DR
+
+```
+DR failover succeeded. DR is now the active primary.
+Original primary region is repaired. How to fail BACK?
+
+Step 1: Rebuild primary as a replica (NOT as primary)
+  Point repaired primary at DR as its replication source
+  Full base backup from DR → restore on primary
+  Begin streaming replication: DR → primary
+  Wait for replication lag to reach 0
+
+Step 2: Validate primary replica
+  Compare row counts, checksums, query results
+  Run application smoke tests against primary replica (read-only)
+  Confirm: primary has ALL data that DR accumulated during outage
+
+Step 3: Planned failover (during maintenance window)
+  Announce maintenance window (e.g., 2 minutes)
+  Stop writes to DR (brief downtime)
+  Wait for primary to catch up (last few transactions)
+  Promote primary back to leader
+  Point all traffic to primary
+  DR becomes standby again
+
+Step 4: Post-failback monitoring
+  Watch for: replication lag, error rates, latency
+  Keep DR hot for 48 hours (quick re-failover if primary has issues)
+
+Duration: Step 1 takes hours (full sync), Steps 2-4 take minutes
+Total failback time: 2-12 hours (depending on data volume)
+
+Danger: If you fail back too quickly without full sync:
+  Primary missed transactions that happened on DR during the outage
+  Those transactions are LOST when traffic switches back to primary
+  → Always verify full sync before failback
+```
+
+### Active-Active Multi-Region: The Holy Grail (and Its Costs)
+
+```
+Instead of active-passive, run BOTH regions as active simultaneously:
+  Users in US → us-east-1 (reads AND writes)
+  Users in EU → eu-west-1 (reads AND writes)
+  
+  Both regions replicate to each other (bidirectional)
+  If either region fails → other handles ALL traffic
+
+Why it's hard:
+  
+  Conflict resolution:
+    User updates profile in us-east at T=100, and in eu-west at T=101
+    Both regions accepted the write → which one wins?
+    
+    Strategies:
+      Last-write-wins (LWW): higher timestamp wins → simple but lossy
+      Application-level merge: merge non-conflicting fields → complex
+      CRDTs: data structures that auto-merge → limited to specific types
+      Region-owned data: user's primary region handles writes → no conflicts
+  
+  Referential integrity:
+    Order created in us-east references user created in eu-west
+    Replication lag: user hasn't replicated to us-east yet → foreign key violation
+    
+    Solution: use global IDs (no foreign keys), eventual consistency accepted
+    OR: route user + all related entities to same region (partition by user)
+
+  When active-active makes sense:
+    ✓ Read-heavy workloads (global CDN-like caching, no write conflicts)
+    ✓ Partition-able data (each user assigned to home region)
+    ✓ CRDT-compatible operations (counters, sets, append-only logs)
+    
+  When active-passive is better:
+    ✓ Strong consistency required (financial, inventory)
+    ✓ Complex transactions spanning multiple entities
+    ✓ Write-heavy workloads (replication lag causes conflicts)
+    ✓ Simpler operations (most organizations)
+```
+

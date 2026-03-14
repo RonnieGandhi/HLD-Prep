@@ -293,3 +293,201 @@ Unique challenges:
 - Room booking: exclusion constraints prevent overlapping reservations at DB level
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Scalability: Sharding Calendar Data
+
+```
+1B users, 50B events → need horizontal scaling
+
+Shard by calendar_id (≈ user_id for primary calendar):
+  events table:          shard by calendar_id
+  event_attendees table: shard by event_id (co-located with event)
+  recurrence_exceptions: shard by event_id (co-located with event)
+  
+  1B users / 256 shards = ~4M users per shard
+  ~200M events per shard → manageable with PostgreSQL + partitioning
+
+  Single-user operations (most common):
+    "Show my calendar for this week" → single shard query ✓
+    "Create event on my calendar" → single shard write ✓
+  
+Cross-shard challenges:
+
+  1. Free/busy query for 10 attendees across 10 shards:
+     Naive: 10 DB queries to 10 different shards → 10 round-trips → slow
+     Solution: Pre-computed free/busy bitmasks in Redis (already in design)
+       Key: freebusy:{user_id}:{date}
+       Value: 32-bit bitmask (one bit per 15-min slot, 8 hours)
+       Free/busy query: 10 Redis GETS → bitwise AND → O(1) merge
+       No cross-shard DB queries needed ✓
+
+  2. Shared calendar (team calendar with 50 members):
+     All 50 members need to see updates instantly
+     Event created on shard A → notifications to users on shards B, C, D...
+     Solution: Kafka topic calendar-changes → each shard's consumer
+       processes events for its users → push via WebSocket
+     Eventual consistency: updates visible within 2-5 seconds
+
+  3. Room booking across organizations:
+     Rooms are shared resources, not user-owned
+     Solution: Separate rooms shard (low cardinality: ~100K rooms total)
+       OR: single PostgreSQL instance for rooms (with exclusion constraints)
+       Room booking: write to rooms DB + write to user's shard
+       Two-phase: rooms DB first (authoritative), user shard second
+```
+
+### Offline Sync Conflict Resolution
+
+```
+Scenario: User edits event on phone (offline), then edits same event on laptop.
+  Phone reconnects → server has a newer version from laptop.
+
+Strategy: Field-level merge with last-write-wins per field
+
+  Phone edit (offline, T=10:00): Changed title to "Team Standup v2"
+  Laptop edit (online, T=10:05): Changed time to 10:30 AM
+  
+  Phone reconnects at T=10:15:
+    Server compares field-by-field:
+    - title: phone="Team Standup v2" (T=10:00), server="Team Standup" (T=9:00)
+      → Phone is newer → accept phone's title ✓
+    - time: phone=10:00 AM (T=9:00, unchanged), server=10:30 AM (T=10:05)
+      → Server is newer → keep server's time ✓
+    - Result: title="Team Standup v2", time=10:30 AM (merged!)
+
+Same-field conflict:
+  Phone: changed time to 11:00 AM (T=10:00)
+  Laptop: changed time to 10:30 AM (T=10:05)
+  
+  Resolution: Last-write-wins by timestamp → laptop's 10:30 AM wins
+  Notification: "Your offline edit to meeting time was overridden. 
+    You set 11:00 AM, but [Laptop] changed it to 10:30 AM at 10:05."
+  User can re-edit if needed.
+
+Deletion conflict:
+  Phone (offline): Deletes the event
+  Laptop (online): Adds an attendee to the event
+  
+  Option A: Delete wins (simpler, data loss risk)
+    Event is deleted. Attendee addition is discarded.
+    Notify laptop user: "This event was deleted from [Phone]"
+  
+  Option B: Preserve with changes (user-friendlier)
+    Keep the event (un-delete), apply attendee addition
+    Mark as "conflict resolved — event restored"
+    This is Google Calendar's approach for most cases
+
+Recurring event conflict:
+  Phone (offline): Edits "this occurrence" (March 20 standup → 11 AM)
+  Laptop (online): Edits "this and all following" (all standups → 10:30 AM)
+  
+  Resolution:
+    1. Server applies laptop's "all following" first (bulk rule change)
+    2. Server applies phone's single exception on top (March 20 → 11 AM)
+    3. Result: all standups move to 10:30 AM, EXCEPT March 20 which is 11 AM
+    4. The exception is stored in recurrence_exceptions table
+
+Sync protocol (CalDAV sync-token):
+  Client stores last_sync_token per calendar
+  On reconnect: GET /calendars/cal1?sync-token=42
+  Server returns: all changes since token 42 (efficient delta sync)
+  Client applies changes, resolves conflicts locally, pushes pending offline edits
+  Server resolves any remaining conflicts server-side
+```
+
+### RRULE Expansion at Read-Time vs Materialized Occurrences
+
+```
+Option 1: Expand at read time (this design) ⭐
+  Store: 1 row with RRULE "FREQ=WEEKLY;BYDAY=MO,WE,FR"
+  Query: expand to individual occurrences when rendering calendar view
+  
+  ✓ Storage efficient: 1 row instead of 365+ rows per recurring event
+  ✓ "Edit all future" is a single row update
+  ✓ RRULE change is instant (no bulk update of 365 rows)
+  ✗ CPU cost at read time (RRULE expansion library, ~1ms per event)
+  ✗ Complex query: "all events on March 20" requires expanding ALL
+    recurring events to check if they fall on that date
+  
+  Mitigation: Redis cache of expanded events for next 30 days
+    Invalidation: on event create/update → recompute affected days
+    Cache hit: skip expansion entirely → O(1) calendar view
+
+Option 2: Materialized occurrences
+  Store: 365 rows for "daily standup for 1 year"
+  Query: simple SELECT WHERE date = 'March 20'
+  
+  ✓ Simple queries (no expansion logic)
+  ✓ Per-occurrence modifications are just row updates
+  ✗ Storage explosion: 500B+ rows for all users' recurring events
+  ✗ "Edit all future" requires updating 200+ rows atomically
+  ✗ RRULE change (e.g., cancel recurring) → bulk delete
+  
+  Used by: Outlook (internally materializes for performance)
+
+Recommendation: Expand at read time + aggressive caching
+  The storage savings (100×) and write simplicity outweigh 
+  the read-time expansion cost (cached and amortized)
+```
+
+### Bitmask Granularity: 15-min vs Per-Minute
+
+```
+15-minute slots (this design):
+  8-hour workday × 4 slots/hour = 32 bits per day per user
+  1B users × 365 days × 4 bytes = 1.46 TB for full year
+  Bitwise AND for group query: single CPU instruction
+  ✓ Fixed 32-bit integer — CPU-native operations
+  ✓ Sufficient for meeting scheduling (meetings rarely start at :07)
+  ✗ Loses precision: 15-min meeting at 10:00-10:15 blocks entire 10:00-10:15 slot
+  
+Per-minute slots:
+  8-hour workday × 60 slots/hour = 480 bits per day per user
+  1B users × 365 days × 60 bytes = 22 TB for full year (15× more)
+  Bitwise AND: 8 × 64-bit operations (still fast, but more memory)
+  ✓ Precise availability for any duration
+  ✗ 15× more storage and memory
+  ✗ Diminishing returns — nobody schedules 7-minute meetings
+  
+5-minute slots (compromise):
+  8 hours × 12 slots/hour = 96 bits per day per user
+  Fits in 2 × 64-bit integers
+  ✓ Precise enough for most use cases
+  ✓ 3× more storage than 15-min, 5× less than per-minute
+
+Recommendation: 15-minute slots (Google Calendar's approach)
+  Standard meeting durations (15, 30, 45, 60 min) align perfectly
+  For sub-15-min events: round up to nearest slot (conservative)
+```
+
+### PostgreSQL Exclusion Constraint vs Application-Level Locking
+
+```
+Exclusion Constraint (this design):
+  EXCLUDE USING gist (room_id WITH =, tsrange(start_time, end_time) WITH &&)
+  
+  ✓ Database enforces invariant — impossible to bypass from any client
+  ✓ No application code needed for conflict detection
+  ✓ Works even if a bug in application logic skips the check
+  ✗ PostgreSQL-specific (not portable to MySQL, DynamoDB)
+  ✗ GiST index overhead: slower INSERTs (~2× vs plain B-tree)
+  ✗ Error handling: application must catch exclusion violation exception
+
+Application-Level Locking:
+  BEGIN; SELECT ... FOR UPDATE WHERE room_id AND date_range overlap; 
+  if count = 0 → INSERT; COMMIT;
+  
+  ✓ Works with any database
+  ✓ More flexible (can add custom logic: "allow overlap if same organizer")
+  ✗ Bug risk: if application forgets the check → double booking
+  ✗ Race condition if isolation level is wrong (need SERIALIZABLE or careful FOR UPDATE)
+  
+Recommendation: Use exclusion constraint as safety net + application check
+  Application does the overlap check (good UX, return "room busy" message)
+  Exclusion constraint catches any bugs (database-level guarantee)
+  Belt AND suspenders approach for critical data integrity
+```
+

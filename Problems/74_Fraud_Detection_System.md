@@ -347,3 +347,221 @@ Together: Rules catch known fraud immediately. ML catches new fraud patterns.
   Defense in depth: if ML misses it, rules may catch it (and vice versa).
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Feature Freshness & Staleness Handling
+
+```
+Real-time features (Redis, Flink-updated) can become stale if pipeline lags.
+
+Detection: Every feature hash includes _updated_at timestamp
+  At scoring time:
+    feature_age = now() - features._updated_at
+    if feature_age > 5 minutes for velocity features → STALE
+    if feature_age > 24 hours for historical features → STALE (nightly job late)
+
+Handling stale features:
+  Strategy 1: Conservative bias
+    If velocity features are stale → add +0.15 to fraud score
+    Rationale: "I can't see recent activity → assume higher risk"
+    A legitimate user with stale features gets flagged for REVIEW (not BLOCK)
+    
+  Strategy 2: Default substitution
+    Replace stale feature with population median
+    avg_transaction_amount_30d → unknown → use $75 (population median)
+    Reduces model confidence but doesn't block legitimate users
+    
+  Strategy 3: Feature importance gating
+    If top-5 most important features are stale → route to REVIEW (skip ML)
+    If only minor features are stale → score normally (minor accuracy loss)
+
+Missing features (cold start — new user):
+  Account < 24 hours old → ALL historical features are zero/missing
+  Solution: Use population-level defaults + new_account flag
+    new_account is itself a strong fraud signal (most fraud uses new accounts)
+    Lower REVIEW threshold: score > 0.2 → REVIEW (vs 0.3 for established users)
+
+Monitoring dashboard (ClickHouse):
+  "% of predictions with stale features" — target < 2%
+  "% of predictions with missing features" — target < 5%
+  "Feature freshness p99" — target < 60 seconds for real-time features
+  Alert if any metric exceeds threshold → investigate Flink pipeline health
+```
+
+### Model Version Management During Canary Deploys
+
+```
+Two models always loaded in memory on every Fraud Service instance:
+  Champion: current production model (v12, trained March 7)
+  Challenger: candidate model (v13, trained March 14)
+
+Dual scoring (every transaction scored by BOTH models):
+  Transaction arrives → score with champion → score with challenger
+  Only champion's decision is enforced (allow/review/block)
+  Both scores logged to ClickHouse for comparison
+
+  Why dual scoring?
+    Head-to-head comparison on exact same traffic → no confounding factors
+    Can compare precision/recall offline without any user impact
+    Cost: ~2× CPU for scoring (~10ms × 2 = 20ms)
+    Since scoring is < 20ms and total budget is 100ms → acceptable
+
+Canary deployment stages:
+  Week 1: Shadow mode
+    100% champion enforced, challenger logged only
+    Compare: AUC, precision@0.3, recall, false positive rate
+    
+  Week 2: 5% canary (if Week 1 metrics look good)
+    95% traffic: champion enforced
+    5% traffic: challenger enforced
+    Monitor real-world impact: block rate, review queue size, fraud chargebacks
+    
+  Week 3: 50% split (if Week 2 metrics look good)
+    50/50 split for statistical significance
+    
+  Week 4: 100% promotion (if all metrics pass)
+    Challenger becomes new champion
+    Old champion becomes rollback model
+    
+  Promotion criteria (ALL must pass):
+    Fraud detection rate ≥ champion (no recall regression)
+    False positive rate ≤ champion + 0.5% (acceptable precision loss)
+    Latency p99 ≤ champion + 2ms
+    No category-specific regression (e.g., payment fraud up but promo fraud down → investigate)
+
+Rollback:
+  Config flag: "active_model_version" in Redis
+  Flip from "v13" to "v12" → takes effect within 1 second
+  No deployment needed — both models already in memory
+  Rollback trigger: automated if fraud loss exceeds 120% of champion's loss rate
+```
+
+### Graph Neural Network (GNN) — Production Architecture
+
+```
+GNN does NOT run in the real-time scoring path (too expensive at < 100ms).
+It runs as an OFFLINE batch pipeline that produces per-user risk scores.
+
+Nightly pipeline:
+  1. Build transaction graph (Spark, 2 hours):
+     Nodes: users, devices, IPs, merchants, shipping addresses
+     Edges: user → device (logged in from), user → IP (transacted from),
+            user → merchant (purchased at), user → address (shipped to)
+     Edge weight: number of transactions in last 90 days
+     Graph size: ~500M nodes, ~2B edges
+  
+  2. Community detection — Louvain algorithm (Spark GraphX, 1 hour):
+     Detect clusters of tightly-connected nodes
+     Output: cluster_id for each node
+     
+     Example fraud ring detected:
+       Cluster #4271:
+         50 user accounts
+         Sharing 3 device fingerprints
+         Sharing 2 IP addresses
+         All transacting with merchant M_789
+         Cluster fraud rate: 35% (vs 0.5% baseline)
+         → Flag ALL 50 accounts as graph_risk = HIGH
+  
+  3. Score clusters (Python, 30 min):
+     cluster_fraud_rate = confirmed_fraud_in_cluster / total_in_cluster
+     If cluster_fraud_rate > 10% → all members flagged HIGH
+     If cluster_fraud_rate > 5% → all members flagged MEDIUM
+     
+     Per-user features computed from graph:
+       graph_risk_score: 0.0-1.0 (based on cluster fraud rate)
+       shared_device_count: how many other users share this device
+       cluster_size: how many accounts in the cluster
+       hop_distance_to_known_fraud: shortest path to a confirmed fraudster
+  
+  4. Write to Redis (bulk, 15 min):
+     HSET graph:risk:{user_id} score 0.85 cluster_id 4271 ...
+     TTL: 24 hours (refreshed nightly)
+  
+  At scoring time (real-time):
+     graph_risk = HGET graph:risk:{user_id} score → 0.85 (< 1ms lookup)
+     This is just another feature in the 200-feature vector
+     No GNN inference at runtime — only a pre-computed lookup
+
+  Cost: ~4 hours nightly compute (Spark cluster)
+  Value: catches fraud rings that individual-transaction models miss
+    Without GNN: each account in the ring looks low-risk individually
+    With GNN: shared devices/IPs reveal coordinated fraud
+```
+
+### Fail-Open vs Fail-Close: Threshold-Based Decision
+
+```
+Fraud Service is DOWN. What do we do?
+
+Simplistic: Fail-open (allow all) or Fail-close (block all)
+  Both are bad — either fraud spikes or revenue drops to zero
+
+Threshold-based failover (recommended):
+
+  if fraud_service_available:
+      score = fraud_service.score(transaction)
+      decision = apply_thresholds(score)
+  else:
+      # Graceful degradation based on transaction risk profile
+      if transaction.amount < $50 AND user.account_age > 90 days:
+          decision = ALLOW  # Low risk, high confidence user
+          # Async: queue for post-hoc fraud review when service recovers
+      elif transaction.amount > $500 OR user.account_age < 7 days:
+          decision = DECLINE  # High risk, protect the platform
+      else:
+          decision = ALLOW  # Medium risk, allow with async review
+          # Apply basic rule checks in-process (no ML):
+          if user.country != card.issuing_country:
+              decision = DECLINE
+          if transaction_count_last_hour > 10:  # simple velocity check
+              decision = DECLINE
+
+  Revenue impact analysis:
+    Average fraud service downtime: 5 min/month
+    During 5 min downtime with threshold-based failover:
+      ~1,500 transactions processed (5K/sec × 5 min sample)
+      ~750 low-risk auto-allowed → 0 expected fraud
+      ~250 high-risk auto-declined → $12,500 lost revenue
+      ~500 medium-risk auto-allowed → ~$250 fraud loss (0.1% fraud rate)
+      Total impact: ~$12,750 vs $0 loss if system stays up
+      
+    Compare: fail-close (block all) → $75,000 lost revenue in 5 min
+    Compare: fail-open (allow all) → $3,750 fraud loss in 5 min
+    Threshold-based: best of both worlds
+```
+
+### Weekly vs Daily Model Retraining
+
+```
+Weekly retraining (current design):
+  ✓ Stable: model has time to be evaluated before next version
+  ✓ Sufficient for most fraud patterns (evolve over weeks, not hours)
+  ✗ New fraud campaign on Monday → model doesn't learn until next Monday
+  ✗ 7-day latency to adapt to new patterns
+
+Daily retraining:
+  ✓ 7× faster adaptation to new patterns
+  ✓ Captures weekend vs weekday differences better
+  ✗ More infrastructure: daily training pipeline, daily validation
+  ✗ Risk of overfitting to noise (one bad day pollutes model)
+  ✗ Need robust automated validation (can't manually review daily)
+
+Hybrid approach (recommended):
+  Base model: retrained weekly (stable foundation)
+  Rule engine: updated within HOURS for known new patterns
+    → Analyst spots new pattern → creates rule → deployed in 30 min
+    → Rule catches new fraud immediately while model takes a week to learn
+  
+  Example timeline:
+    Monday 10 AM: New fraud pattern detected (fake refunds on gift cards)
+    Monday 11 AM: Analyst creates rule: "block refund if gift card + amount > $200"
+    Monday 11:30 AM: Rule deployed → pattern blocked immediately
+    Following Monday: Model retrained with labeled examples → catches variations too
+    Monday+2 weeks: Rule can be retired (model handles it natively)
+
+  Rules are fast first-responders. ML is the long-term defense.
+```
+

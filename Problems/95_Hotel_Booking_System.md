@@ -247,3 +247,168 @@ Ticketing: No overbooking (each seat is physical)
 Hotel: Controlled overbooking is standard industry practice
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Scalability: Sharding Strategy
+
+```
+1M hotels, 50M rooms, 18.25B room-nights → need horizontal scaling
+
+Shard by hotel_id:
+  room_inventory: Shard key = hotel_id
+    All room-nights for a hotel co-located on one shard
+    Booking transaction: hits ONE shard (single-shard ACID transaction)
+    No distributed transactions needed for a single booking
+  
+  1M hotels / 16 shards = ~62,500 hotels per shard
+  Each shard: ~1.14B room-night rows → manageable with PostgreSQL partitioning
+  
+  Within each shard: partition room_inventory by date range
+    PARTITION BY RANGE (date)
+    Each partition = 1 month of data
+    Query "Dec 20-25" hits 1 partition (fast) not scanning full year
+
+Search (cross-shard):
+  "Find available hotels in NYC for Dec 20-25"
+  
+  Step 1: Elasticsearch returns matching hotels (geo + filters) — not sharded by hotel
+  Step 2: For top 50 results, check availability:
+    Group hotels by shard → fan-out availability queries (at most 16 parallel queries)
+    Each shard: SELECT for those hotel_ids + date range → return availability
+    Merge results → return to client with prices
+  
+  Optimization: Redis cache per hotel with availability bitmap
+    Key: avail:{hotel_id}:{room_type}:{month}
+    Value: bitmask (1 bit per day, 1=available, 0=booked)
+    Lookup: bitwise AND across date range → instant availability check
+    Invalidation: on booking/cancellation, update bitmask in Redis
+    Cache hit: skip DB query entirely for search results
+
+Reservation table: shard by reservation_id (or hotel_id for co-location)
+  Guest lookups ("my reservations"): secondary index on guest_id
+  Or: separate guest_reservations table sharded by guest_id (CQRS pattern)
+```
+
+### Race Condition Deep Dive: Isolation Levels
+
+```
+The booking transaction needs to prevent two users from simultaneously
+booking the last room for the same night.
+
+READ COMMITTED (PostgreSQL default):
+  Transaction A: SELECT booked_rooms WHERE hotel=X, date='Dec 22' FOR UPDATE
+    → sees booked_rooms = 9 (of 10 total) → 1 available
+  Transaction B: also tries SELECT FOR UPDATE on SAME row
+    → BLOCKED by A's row lock → waits
+  Transaction A: UPDATE booked_rooms = 10, COMMIT
+  Transaction B: unblocked, re-reads → sees booked_rooms = 10 → no availability → ROLLBACK
+  
+  ✓ Correct! FOR UPDATE provides row-level exclusive lock
+  ✓ No double-booking possible for SAME rows
+
+  BUT: What about phantom reads in date range?
+  Transaction A: SELECT ... WHERE date BETWEEN 'Dec 20' AND 'Dec 25' FOR UPDATE
+    → Locks rows for Dec 20-25
+  Transaction B: INSERT a new inventory row for Dec 23 (admin adds rooms)
+    → READ COMMITTED allows this INSERT (no gap lock)
+    → Transaction A doesn't see the new row → stale data
+  
+  In practice: this is fine for hotel booking because:
+    room_inventory rows are pre-created for all dates (365 days ahead)
+    No INSERTs during booking — only UPDATEs to existing rows
+    FOR UPDATE on existing rows is sufficient
+
+SERIALIZABLE (strongest):
+  Prevents ALL anomalies including phantoms
+  Uses predicate locks (lock the RANGE, not just existing rows)
+  
+  ✓ Bulletproof correctness
+  ✗ Higher abort rate under contention (serialization failures)
+  ✗ Application must retry on serialization failure
+  
+  When to use: if room_inventory rows are NOT pre-created and
+  the system dynamically inserts inventory → SERIALIZABLE prevents phantoms
+
+Recommendation for hotel booking:
+  Pre-create room_inventory rows for 365 days → use READ COMMITTED + FOR UPDATE
+  The CHECK constraint (booked_rooms <= overbooking_limit) provides an
+  additional database-level safety net even if application logic has a bug
+```
+
+### Pooled Inventory vs Named-Room Assignment
+
+```
+Pooled (this design):
+  "5 Deluxe King rooms available on Dec 20" — any of the 5 rooms
+  Booking decrements a counter, specific room assigned at check-in
+  ✓ Simpler booking logic (count-based)
+  ✓ Flexible room assignment (maintenance, upgrades, requests)
+  ✗ Can't guarantee "same room for 3-night stay"
+  ✗ Can't sell "room with ocean view" as distinct inventory
+
+Named-Room Assignment:
+  Room 401, Room 402, ... each tracked individually
+  Booking locks a SPECIFIC room for the date range
+  ✓ Guest preferences ("I want room 401 again")
+  ✓ Distinct pricing for view/floor (Room 401 = $200, Room 405 = $250)
+  ✗ More complex locking (must lock specific room across dates)
+  ✗ Fragmentation: Room 401 free Dec 20-21, Room 402 free Dec 22-23
+     → Neither can serve a Dec 20-23 booking even though hotel has availability
+
+  Industry practice: Pooled inventory for booking, named assignment at check-in
+    Exception: luxury hotels sell specific rooms (suites, penthouses)
+```
+
+### Eager Payment vs Lazy Payment
+
+```
+Eager (charge at booking):
+  ✓ Revenue certainty — money collected immediately
+  ✓ Reduces no-shows (financial commitment)
+  ✗ Higher cancellation friction → lost bookings
+  ✗ Refund processing cost for cancellations
+  Best for: Non-refundable rates, flash sales, peak season
+
+Lazy (charge at check-in or post-stay):
+  ✓ Lower booking friction → higher conversion
+  ✓ No refund processing for cancellations
+  ✗ No-show risk (guest never shows, never pays)
+  ✗ Card might be declined at check-in
+  Best for: Flexible rates, business travel, loyalty members
+
+Hybrid (industry standard):
+  Authorization hold at booking ($1 or full amount) → validates card
+  No-show fee: charge 1 night if guest doesn't cancel by deadline
+  Capture: charge on check-in or check-out (depending on hotel policy)
+  Non-refundable rate: charge immediately (lower price, no cancellation)
+```
+
+### Search Staleness vs Real-Time Availability
+
+```
+Problem: Search shows "5 rooms available" → user clicks → booking fails
+  (someone else booked during the 30 seconds between search and click)
+
+Option 1: Real-time availability on every search result
+  For each of top 50 hotels: query room_inventory DB
+  ✗ 50K searches/sec × 50 hotels = 2.5M DB queries/sec → DB dies
+
+Option 2: Cached availability with staleness ⭐
+  Redis bitmap per hotel, refreshed every 30 seconds
+  Search uses cached availability — may be stale by up to 30s
+  Final check at booking time (authoritative DB query with FOR UPDATE)
+  If booking fails due to stale cache → show "Sorry, this room just sold out"
+  Acceptable UX: < 1% of booking attempts fail due to staleness
+  
+  ✓ DB handles only actual booking attempts (5K/sec not 2.5M/sec)
+  ✗ Occasional "phantom availability" shown to users
+
+Option 3: Pessimistic display (show fewer rooms than available)
+  Cache shows "available" only if real availability > 2
+  The last 1-2 rooms are hidden from search, only shown on direct hotel page
+  ✓ Fewer failed booking attempts
+  ✗ Might undercount availability → lost revenue
+```
+

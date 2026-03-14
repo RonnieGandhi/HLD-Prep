@@ -288,3 +288,201 @@ Flags: change in 5 sec, targeted, audited, reversible, schedulable
 Kill switch alone justifies the system for any org with >100 engineers
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Race Condition Analysis
+
+```
+Race 1: Flag update arrives DURING an evaluation
+
+  Thread A: evaluating flag "new_checkout" for user X
+    1. Read flag definition from in-memory ConcurrentHashMap
+    2. Evaluate targeting rules
+    3. Compute hash for percentage rollout
+    4. Return result
+  
+  Thread B (SSE listener): new flag snapshot arrives
+    1. Deserialize new flag definitions
+    2. Build new immutable Map
+    3. Atomic pointer swap: this.flags = newMap  (volatile write)
+  
+  Is this safe? YES.
+    Thread A reads flags reference once at step 1 (volatile read)
+    Even if Thread B swaps the pointer during steps 2-4,
+    Thread A still holds a reference to the OLD map → completes consistently
+    Next evaluation will see the NEW map
+    
+    Java volatile guarantees: write in Thread B happens-before
+    any subsequent read in Thread A (JMM memory model)
+    
+    No partial state: Thread A sees ALL old flags or ALL new flags, never a mix
+
+Race 2: Multi-flag dependency during update
+
+  Flag B depends on Flag A: "B is enabled ONLY IF A is enabled"
+  Update: disable Flag A
+  
+  Problem window (~10ms):
+    T+0ms: SSE delivers new snapshot to SDK
+    T+5ms: SDK starts building new map
+    T+8ms: Evaluation request → reads OLD map → A=enabled, B=enabled ✓
+    T+10ms: New map swapped (A=disabled, B=disabled) ✓
+    
+    No issue: atomic snapshot swap means both flags change together
+    
+  BUT: What if Flag A and Flag B are on DIFFERENT relay messages?
+    T+0ms: Relay sends "Flag A disabled"
+    T+5ms: SDK updates A → A=disabled, B still=enabled → INCONSISTENT!
+    T+100ms: Relay sends "Flag B disabled"
+    
+    Solution: Always send FULL flag snapshot (not individual flag deltas)
+    Trade-off: more bandwidth (~50 KB per update) vs consistency guarantee
+    This is why LaunchDarkly and similar systems use full snapshot pushes
+
+Race 3: Scheduled flag activation with clock skew
+
+  Admin schedules: "Enable flag X at 9:00 AM EST"
+  
+  Scheduler runs on Server A (clock: 9:00:00.000)
+  SDK on Server B (clock: 8:59:58.200 — 1.8s behind)
+  SDK on Server C (clock: 9:00:01.500 — 1.5s ahead)
+  
+  Server C sees flag enabled 1.5s before Server A activates it? NO.
+  Server B evaluates flag as disabled 1.8s after it should be on? YES.
+  
+  Solutions:
+    1. NTP sync all servers to < 500ms accuracy (practical minimum)
+    2. For time-critical activations: use server-side evaluation
+       SDK calls API: "Is flag X enabled for user Y?"
+       Server uses canonical server time → consistent across all clients
+       Trade-off: 5ms latency per evaluation vs 0ms for local evaluation
+    3. Pre-activate 5 seconds early, rely on relay propagation
+       By T=0, all SDKs have received the update
+       Trade-off: flag appears 5 seconds early for some users (acceptable)
+```
+
+### Consistency Model
+
+```
+This system provides BOUNDED EVENTUAL CONSISTENCY:
+  After a flag change, all SDKs converge to the new state within ~10 seconds
+
+  Timeline of a flag change:
+    T+0s:     Admin clicks "Enable flag" in dashboard
+    T+0.1s:   API writes to PostgreSQL (committed)
+    T+0.2s:   API publishes to Kafka (flag-changes topic)
+    T+0.5s:   Relay Service consumes from Kafka
+    T+1s:     Relay pushes update via SSE to all connected SDKs
+    T+5s:     All healthy SDKs have received update (SSE propagation)
+    T+10s:    SDKs that were reconnecting have received update (poll fallback)
+    T+30s:    SDKs with network issues have received update (poll retry)
+
+  During the T+0 to T+10s window:
+    Some users see old flag state, others see new
+    This is acceptable for feature flags (not financial data)
+    
+  For kill switches requiring stronger consistency:
+    Use server-side evaluation via API call
+    API reads from Redis (refreshed within 1 second of DB write)
+    Latency: ~5ms per evaluation
+    Only use for critical flags (< 1% of all evaluations)
+
+CAP analysis:
+  Network partition between Relay and Kafka:
+    SDKs can't receive updates → serve stale cached flags
+    Choice: AVAILABILITY over consistency
+    Alternative: refuse to evaluate → blocks all feature-flagged code paths
+    → Clearly wrong: serving stale flags is better than crashing the app
+    
+  This is an AP system by design.
+  Flags are NOT a source of truth for critical business logic.
+  Critical decisions (payments, inventory) should NOT depend solely on flags.
+```
+
+### Full Snapshot Push vs Delta Updates
+
+```
+Full Snapshot (this design, LaunchDarkly approach):
+  Every update: relay sends complete set of all flag definitions (~50 KB)
+  SDK replaces entire in-memory map atomically
+  
+  ✓ Always consistent (all flags in sync)
+  ✓ Recovery is trivial (missed an update? Full snapshot on reconnect)
+  ✓ No ordering dependencies (no "apply delta 42 before delta 43")
+  ✗ Bandwidth: 100K SDKs × 50 KB × 50 updates/day = 250 GB/day
+  
+Delta Updates (alternative):
+  Only send the changed flag definition (~1 KB)
+  SDK applies patch to in-memory map
+  
+  ✓ 50× less bandwidth per update
+  ✗ Ordering matters: missed delta → state diverges
+  ✗ Need sequence numbers and gap detection
+  ✗ Recovery requires full snapshot anyway (bootstrap + catch-up)
+  ✗ Multi-flag dependency race (see Race 2 above)
+  
+Recommendation: Full snapshot (simplicity + consistency > bandwidth)
+  50 KB compressed to ~15 KB with gzip → 75 GB/day → trivial at scale
+```
+
+### In-Process SDK vs Remote Evaluation API
+
+```
+In-Process SDK (this design, recommended):
+  Flag definitions downloaded to SDK → evaluated locally in memory
+  Latency: ~100 ns (pure memory read, zero I/O)
+  Availability: 100% (works offline, on crash, during network partition)
+  
+  ✗ Flag definitions exposed to client (security for server-side)
+  ✗ SDK size (~500 KB library added to application)
+  ✗ SDK must be updated when evaluation logic changes
+
+Remote Evaluation API:
+  Every evaluation → HTTP call to Flag Service
+  Latency: 5-20 ms (network round-trip)
+  Availability: depends on Flag Service uptime
+  
+  ✓ No SDK to maintain per language
+  ✓ Flag definitions never leave the server (secure)
+  ✗ 1M evaluations/day × 10ms = 2.8 hours of cumulative latency
+  ✗ Network failure → flags stop working (unless cached)
+  
+  Used for: client-side SDKs (browser, mobile)
+    Client can't be trusted with all flag definitions
+    Server evaluates for the specific user → returns results only
+
+Production pattern:
+  Server-side: in-process SDK (Java, Go, Python) → 0ms latency
+  Client-side: server evaluates on behalf of client → returns user's flags
+    Initial page load: one batch API call for all flags → cache locally
+    Updates: SSE stream of evaluated results (not raw definitions)
+```
+
+### Deterministic Hash vs Server-Assigned Cohort
+
+```
+Deterministic Hash (this design, MurmurHash3):
+  bucket = hash(flag_key + ":" + user_id) % 100
+  ✓ Stateless: any SDK instance computes same result
+  ✓ No storage: cohort assignment not stored anywhere
+  ✓ Monotonic rollout: 25% → 50% → users 0-24 stay ON, 25-49 added
+  ✗ Can't manually override specific users' cohort (except via allowlist)
+  ✗ Hash collisions: two flags may assign same users to treatment
+    Mitigation: include flag_key in hash → independent assignments per flag
+
+Server-Assigned Cohort:
+  On first evaluation: server assigns user to cohort, stores in DB
+  ✓ Full control: admin can move specific users between cohorts
+  ✓ Stable assignment even if hash function changes
+  ✓ Cross-flag coordination (ensure user in experiment A isn't in B)
+  ✗ Requires DB lookup per new user → latency
+  ✗ Storage: 1B users × 10K flags = 10T assignments → expensive
+  ✗ Not stateless: SDK must query server for assignment
+
+Recommendation: Deterministic hash for most flags
+  Server-assigned only for formal A/B experiments requiring strict isolation
+  Experiment platform (see #79) handles server-assigned cohorts separately
+```
+

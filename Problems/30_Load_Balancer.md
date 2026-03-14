@@ -410,3 +410,204 @@ Each service has a sidecar proxy that handles:
 - **Health check success rate**
 - **Connection queue depth** (requests waiting for a backend connection)
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### L4 vs L7: Packet Path Walkthrough
+
+```
+L4 Load Balancer (NAT mode) — what happens to each packet:
+
+  Client sends:
+    SRC: 198.51.100.5:4321  DST: 10.0.0.1:80 (VIP)
+    
+  LB receives, selects Server 2 (10.0.1.6:8080):
+    Rewrites DST: 10.0.0.1:80 → 10.0.1.6:8080
+    Stores mapping in connection table:
+      {198.51.100.5:4321} → {10.0.1.6:8080}
+    Forwards packet:
+    SRC: 198.51.100.5:4321  DST: 10.0.1.6:8080
+    
+  Server 2 responds:
+    SRC: 10.0.1.6:8080  DST: 198.51.100.5:4321
+    
+  LB receives, looks up connection table:
+    Rewrites SRC: 10.0.1.6:8080 → 10.0.0.1:80
+    Forwards to client:
+    SRC: 10.0.0.1:80  DST: 198.51.100.5:4321
+    
+  Client sees response from 10.0.0.1:80 (VIP) → transparent
+  
+  Cost: 2 rewrites per packet (DNAT inbound, SNAT outbound)
+  Throughput: kernel-level NAT → millions of packets/sec
+  Limitation: LB sees ALL traffic (both directions) → bottleneck for 
+              bandwidth-heavy responses (e.g., video streaming)
+
+
+L4 Load Balancer (DSR mode) — bypasses LB on return:
+
+  Client sends:
+    SRC: 198.51.100.5:4321  DST: 10.0.0.1:80 (VIP)
+    
+  LB receives, selects Server 2:
+    Changes L2 header (MAC address) to Server 2's MAC
+    Does NOT rewrite IP addresses
+    Packet arrives at Server 2 with DST still = 10.0.0.1 (VIP)
+    (Server 2 must have VIP configured on loopback interface)
+    
+  Server 2 responds DIRECTLY to client:
+    SRC: 10.0.0.1:80 (VIP)  DST: 198.51.100.5:4321
+    (Response goes straight to client, NOT through LB)
+    
+  Advantage: LB only handles inbound traffic
+    For web traffic: request = 1 KB, response = 100 KB
+    LB handles 1% of total traffic → 100× more capacity than NAT mode
+    
+  Requirement: LB and backends must be in same L2 network (same VLAN)
+    DSR doesn't work across subnets (L2 rewrite only)
+
+
+L7 Load Balancer — full HTTP inspection:
+
+  Client sends:
+    TLS ClientHello → LB terminates TLS → decrypts HTTP
+    LB reads: GET /api/v1/users/123  Host: api.example.com
+    
+  LB routing decision:
+    Path matches "/api/v1/users/*" → backend pool "user-service"
+    Algorithm: least connections → Server 3 (fewest active)
+    
+  LB opens NEW TCP connection to Server 3:
+    SRC: LB_internal_IP  DST: 10.0.1.7:8080
+    Sends proxied HTTP request (adds X-Forwarded-For header)
+    
+  Server 3 responds → LB receives → re-encrypts → sends to client
+  
+  Cost: full TCP termination + TLS + HTTP parse on EVERY request
+  Throughput: ~100K req/sec per LB instance (vs millions for L4)
+  Advantage: content-based routing, caching, compression, WAF
+```
+
+### Connection Table Scaling
+
+```
+Problem: L4 NAT LB maintains a connection table entry for EVERY active connection
+  10M concurrent connections × 128 bytes per entry = 1.28 GB
+  
+  Connection table operations:
+    Insert: O(1) hash table insert per new connection
+    Lookup: O(1) per packet (hash by 5-tuple: src_ip, dst_ip, src_port, dst_port, proto)
+    Delete: O(1) on connection close or timeout
+    
+  Memory pressure:
+    10M entries fits in RAM easily
+    But: hash table with 10M entries → cache misses for random access
+    At 1M packets/sec → 1M hash lookups/sec → CPU cache thrashing
+    
+  Solution: Kernel bypass (DPDK, XDP)
+    Bypass the kernel network stack entirely
+    Process packets in user space with poll-mode drivers
+    Pre-allocate connection table in huge pages (no TLB misses)
+    Pin to dedicated CPU cores (no context switches)
+    Result: 10M+ packets/sec on commodity hardware
+
+  Connection timeout:
+    TCP established: 300 seconds (default)
+    TCP time_wait: 120 seconds
+    UDP: 30 seconds
+    Aggressive timeouts free table entries faster but may drop slow clients
+
+  Connection table failover:
+    Active LB syncs connection table to standby via multicast
+    On failover: standby has ~99% of connections → most clients unaffected
+    Missing entries: those connections reset → client reconnects
+    For DSR: no connection table needed on return path → cleaner failover
+```
+
+### Consistent Hashing with Bounded Loads (Google Maglev)
+
+```
+Problem with standard consistent hashing for LB:
+  Server S3 has hash position right after a large gap on the ring
+  → S3 gets 40% of traffic while S1 and S2 get 30% each
+  Virtual nodes help but don't guarantee bounds
+
+Google's Maglev hashing:
+  Build a lookup table of size M (prime, e.g., 65537)
+  Each backend gets a "preference list" of table positions:
+    preference[i] = (offset + i × skip) mod M
+    offset = hash1(backend_name) mod M
+    skip = hash2(backend_name) mod (M-1) + 1
+    
+  Fill the table round-robin by preference:
+    Entry 0: Backend A (A's first preference is position 0)
+    Entry 1: Backend B (B's first preference is position 1)
+    Entry 2: Backend C (C's first preference is position 2)
+    ...continue until all M entries filled
+    
+  Lookup: table[hash(5-tuple) mod M] → backend
+  
+  Properties:
+    Disruption: adding/removing 1 of N backends moves only ~1/N of entries
+    Uniformity: each backend gets exactly M/N ± 1 entries (near-perfect balance)
+    Speed: single array lookup → O(1) per packet (cache-friendly)
+    
+  Why it's better than ring-based consistent hashing:
+    Ring: 100-200 virtual nodes needed for reasonable balance → memory
+    Maglev: one 65K-entry table → 512 KB → fits in L2 cache
+    Ring: O(log N) binary search for closest node
+    Maglev: O(1) array lookup
+
+Bounded loads addition:
+  Hard limit: no server gets more than (1 + ε) × average load
+  ε = 0.25 → max 25% over average
+  
+  If selected server exceeds bound:
+    Walk to next server in the table
+    Repeat until finding one below bound
+    
+  Provides: strict load balancing guarantee + consistent hashing benefits
+  Used by: Google (Maglev), Envoy (ring_hash with overprovisioning_factor)
+```
+
+### The LB as Single Point of Failure — Defense in Depth
+
+```
+Layer 1: Active-Passive (VRRP/Keepalived)
+  Two LB instances share a VIP
+  Active handles all traffic
+  Passive monitors Active via heartbeat (every 1 second)
+  Active dies → Passive claims VIP via gratuitous ARP (< 3 seconds)
+  ✓ Simple, proven
+  ✗ Passive wastes resources (idle), 50% hardware utilization
+  ✗ Failover gap: 1-3 seconds of dropped connections
+
+Layer 2: Active-Active (DNS round-robin)
+  DNS returns multiple LB IPs: [10.0.0.1, 10.0.0.2]
+  Both LBs handle traffic simultaneously
+  If one fails → DNS health check removes it
+  ✓ 100% hardware utilization
+  ✗ DNS TTL means clients cache stale IP → traffic to dead LB for TTL duration
+  ✗ Uneven distribution (DNS round-robin is not load-aware)
+
+Layer 3: Anycast (BGP)
+  Both LBs advertise the SAME IP via BGP
+  Network routes packets to the NEAREST LB (by BGP path)
+  If one LB fails → BGP withdraws route → traffic converges to other LB
+  ✓ Automatic, network-level failover (< 30 seconds)
+  ✓ Natural geographic load distribution
+  ✗ BGP convergence can take 10-30 seconds
+  ✗ Requires BGP-capable network infrastructure
+  Used by: Cloudflare, Google, AWS NLB
+
+Layer 4: Distributed LB (no single LB)
+  Service mesh: every service has a sidecar proxy (Envoy)
+  Each sidecar does its own load balancing (client-side LB)
+  No centralized LB → no SPOF
+  ✓ Eliminates LB as bottleneck entirely
+  ✗ Every service needs sidecar → operational complexity
+  ✗ Sidecar resource overhead (CPU/memory per pod)
+  Used by: Kubernetes with Istio/Linkerd
+```
+

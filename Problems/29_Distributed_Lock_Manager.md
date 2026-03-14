@@ -312,3 +312,239 @@ Timeline:
 | Auto-release | TTL | TTL | Ephemeral node + session | Lease TTL |
 | Fencing token | Manual | Manual | Built-in (zxid) | Built-in (revision) |
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Redlock Algorithm — Step-by-Step Walkthrough
+
+```
+Setup: 5 independent Redis instances (NOT replicas — fully independent)
+  Redis-1 (us-east-1a), Redis-2 (us-east-1b), Redis-3 (us-west-2a),
+  Redis-4 (eu-west-1a), Redis-5 (ap-south-1a)
+
+Lock acquisition for resource "inventory:item-42":
+
+  T=0ms:    Client generates: 
+              lock_key = "lock:inventory:item-42"
+              owner_id = UUID "abc-123" (unique per attempt)
+              ttl = 10 seconds
+              
+  T=0ms:    Record start_time = now()
+  
+  T=0ms:    Send SET lock_key abc-123 NX PX 10000 to ALL 5 Redis instances
+            (in parallel, not sequential — critical for latency)
+  
+  T=3ms:    Redis-1 responds: OK (lock acquired)
+  T=4ms:    Redis-2 responds: OK (lock acquired)
+  T=5ms:    Redis-3 responds: nil (lock held by someone else)
+  T=6ms:    Redis-4 responds: OK (lock acquired)
+  T=50ms:   Redis-5: timeout (network delay)
+  
+  T=50ms:   Count successes: 3 out of 5 → majority (≥ N/2+1 = 3) ✓
+  
+  T=50ms:   Compute validity time:
+              elapsed = now() - start_time = 50ms
+              validity = ttl - elapsed - clock_drift_bound
+              validity = 10000ms - 50ms - 20ms = 9930ms
+              (clock_drift_bound ≈ ttl × 0.01 × 2 = 200ms is conservative)
+              validity > 0 → LOCK ACQUIRED ✓
+  
+  Lock is valid for next 9930ms. Client must complete work within this time.
+
+Lock release:
+  Send Lua script to ALL 5 Redis instances (even ones that failed):
+    if redis.call("GET", key) == owner_id then
+        return redis.call("DEL", key)
+    end
+  This ensures we only release OUR lock (not someone else's)
+
+Why ALL 5 on release? If we only release the 3 that succeeded,
+  and Redis-3 (which was held by someone else) later expires,
+  we leave stale lock state. Always clean up everywhere.
+```
+
+### Redlock Failure Scenarios
+
+```
+Scenario 1: Client crashes while holding lock
+  Client acquires lock (3/5 Redis instances)
+  Client crashes → lock expires after TTL (10 seconds)
+  Other clients can acquire after TTL
+  ✓ TTL prevents permanent deadlock
+
+Scenario 2: Redis instance crashes while holding lock
+  Client holds lock on Redis-1, 2, 4 (3/5)
+  Redis-2 crashes → restarts → lock state LOST
+  Another client tries: acquires on Redis-2 (fresh), 3, 5 → 3/5 ✓
+  TWO clients hold the "lock" simultaneously → VIOLATION!
+  
+  Solution: Delayed restart
+    Redis-2 must wait at least TTL seconds before accepting new locks
+    After restart, all locks that existed before crash have expired
+    → No conflict possible
+    
+    Implementation: Redis persistence (AOF with fsync=always) preserves locks
+    OR: just wait TTL after restart before serving lock requests
+
+Scenario 3: Clock drift
+  Client A acquires lock at T=0, TTL=10s
+  Redis-1's clock runs fast → lock expires at T=8 (not T=10)
+  Client B acquires at T=9 → overlap with Client A's expected validity
+  
+  Solution: Include clock drift in validity calculation
+    validity = ttl - elapsed - (ttl × clock_drift_rate)
+    clock_drift_rate ≈ 0.01 (1% — typical for NTP-synced servers)
+    For 10s TTL: validity reduced by 100ms for safety margin
+    
+  Martin Kleppmann's criticism: clock drift is UNBOUNDED in practice
+    GC pauses, VM live migration, NTP jumps → clocks can jump seconds
+    → Redlock's safety depends on bounded clock drift → not provable
+    → Use fencing tokens for true safety (see §7)
+
+Scenario 4: Network partition during lock hold
+  Client holds lock on Redis-1, 2, 4
+  Network partition: Client can reach Redis-1, 2 but NOT Redis-3, 4, 5
+  Lock expires on Redis-4 (unreachable, so client can't renew)
+  Another client acquires on Redis-3, 4, 5 → 3/5
+  Both clients think they hold the lock!
+  
+  Solution: Client must validate lock before critical operation
+    Before protected write: check lock still held (re-read from majority)
+    OR: use fencing tokens (storage server validates token monotonicity)
+```
+
+### ZooKeeper Lock — Why It's Stronger (and Slower)
+
+```
+ZooKeeper lock acquisition:
+
+  1. Client creates EPHEMERAL + SEQUENTIAL znode:
+     CREATE /locks/resource-A/lock- (ephemeral, sequential)
+     → ZK creates: /locks/resource-A/lock-0000000007
+     
+  2. Client lists children of /locks/resource-A/:
+     [lock-0000000003, lock-0000000005, lock-0000000007]
+     
+  3. Is my node the LOWEST numbered? 
+     NO (lock-0000000003 is lower) → I don't have the lock
+     
+  4. Set a WATCH on the node just before mine (lock-0000000005):
+     "Notify me when lock-0000000005 is deleted"
+     
+  5. Wait for notification...
+     
+  6. lock-0000000005 deleted → re-check: am I lowest now?
+     [lock-0000000003, lock-0000000007]
+     NO → watch lock-0000000003
+     
+  7. lock-0000000003 deleted → I am lowest! → LOCK ACQUIRED
+
+Why this is correct:
+  - ZAB consensus: CREATE is linearizable → total order guaranteed
+  - Ephemeral: if client crashes → session expires → znode deleted → lock released
+  - No TTL needed: session heartbeat (not wall clock) determines liveness
+  - No clock drift problem: ZK uses logical ordering, not timestamps
+  
+Why only watch PREDECESSOR (not all children):
+  "Herd effect": if all waiters watch the lock holder,
+    when lock is released → ALL waiters wake up → ALL try to acquire
+    → thundering herd
+  
+  Watching only predecessor: 
+    lock released → only next waiter notified → O(1) notification
+    This is the "scalable lock" pattern from the ZooKeeper recipes
+
+Performance:
+  Acquire: 2 ZK operations (create + getChildren) → ~15-20ms
+  Release: 1 ZK operation (delete) → ~5-10ms
+  Compare: Redis SET NX → ~0.5ms
+  
+  ZK is 20-40× slower but provides linearizable correctness
+```
+
+### Lock Renewal: The Watchdog Pattern
+
+```
+Problem: Long-running operation exceeds lock TTL
+
+  Client acquires lock (TTL=30s)
+  Operation takes 45 seconds
+  At T=30s: lock expires → another client acquires → DATA CORRUPTION
+
+Solution: Background renewal thread (watchdog)
+
+  main_thread:
+    lock = acquire("resource-X", ttl=30s)
+    watchdog = start_renewal_thread(lock, renewal_interval=10s)
+    try:
+        do_critical_work()  // may take 45 seconds
+    finally:
+        watchdog.stop()
+        lock.release()
+  
+  renewal_thread (runs every 10 seconds):
+    while not stopped:
+        sleep(10 seconds)
+        success = extend_lock(lock.key, lock.owner_id, new_ttl=30s)
+        if not success:
+            // Lock was lost (expired between renewals, or stolen)
+            signal_main_thread_to_abort()
+            return
+  
+  Lua script for safe renewal:
+    if redis.call("GET", key) == owner_id then
+        redis.call("PEXPIRE", key, new_ttl)
+        return 1
+    else
+        return 0  -- lock lost, don't extend someone else's lock
+    end
+
+  This is exactly how Redisson (Java) implements its RLock:
+    Default: TTL=30s, renewal every 10s (TTL/3)
+    If client JVM crashes → renewal stops → lock expires in ≤30s
+
+Edge case: GC pause during renewal
+  T=0:   Lock acquired, TTL=30s
+  T=10:  Renewal succeeds, TTL reset to 30s
+  T=15:  JVM enters full GC pause (stop-the-world)
+  T=45:  GC completes (30-second pause!)
+         Renewal thread wakes up → tries to renew → lock has EXPIRED
+         Another client already holds the lock
+         Renewal fails → signal abort to main thread
+  T=45:  But main thread also just woke from GC → it already executed
+         part of the critical section with an expired lock → DATA CORRUPTION
+  
+  This is the Martin Kleppmann problem. Solution: FENCING TOKENS.
+  The renewal watchdog catches MOST cases but not GC pauses.
+  For true correctness: always use fencing tokens with the storage layer.
+```
+
+### When to Use Each Lock Approach
+
+```
+Decision tree:
+
+  Is correctness critical (financial, inventory)?
+    YES → Use ZooKeeper or etcd (consensus-backed, linearizable)
+           + ALWAYS use fencing tokens on the storage layer
+    NO → Continue below
+  
+  Is latency critical (< 1ms)?
+    YES → Use single Redis SET NX
+           Accept: lock may be unsafe during Redis failover (~seconds)
+           Ensure: operations are idempotent (so duplicate execution is harmless)
+    NO → Continue below
+  
+  Do you need to survive Redis failover?
+    YES → Use Redlock (5 independent Redis instances)
+           Accept: theoretical gap during clock drift (see Kleppmann criticism)
+           Mitigate: use fencing tokens for critical operations
+    NO → Single Redis SET NX is sufficient
+  
+  Summary:
+    "This is just to avoid redundant work" → Single Redis, no fencing
+    "This protects a database write" → Redlock + fencing token
+    "This involves money" → ZooKeeper/etcd + fencing token, always
+```
+

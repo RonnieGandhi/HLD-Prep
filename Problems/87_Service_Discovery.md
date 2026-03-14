@@ -347,3 +347,188 @@ Third-Party Registration (Kubernetes, Registrator):
   ❌ Registrator is another component to manage
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Race Conditions in Service Discovery
+
+```
+Race 1: Stale Cache During Rolling Deployment
+
+  T=0:  Service B has 3 instances: B1, B2, B3
+  T=1:  Rolling deploy starts. B1 deregisters.
+  T=2:  Service A's cache still has [B1, B2, B3] (cache TTL: 30s)
+  T=3:  Service A sends request to B1 → connection refused → ERROR
+  
+  Mitigation layers:
+    1. Client-side retry: on connection error, retry with next instance
+    2. Circuit breaker: after 3 failures to B1, stop trying B1
+    3. Background cache refresh: watch-based (instant) not poll-based (stale)
+    4. Connection draining: B1 sends "draining" status BEFORE deregistering
+       → SD marks B1 as "draining" → clients stop sending NEW requests
+       → In-flight requests complete → B1 deregisters after grace period
+
+Race 2: Split-Brain During Network Partition
+
+  SD cluster: 5 Consul servers. Partition splits into [S1, S2] and [S3, S4, S5]
+  
+  [S1, S2] partition (minority):
+    Cannot elect leader (need 3/5 = majority)
+    Cluster becomes read-only → cannot register new services
+    Existing registrations still served from cache
+    Clients in this partition → get stale but valid service list
+  
+  [S3, S4, S5] partition (majority):
+    Elects new leader → accepts new registrations normally
+    Services in this partition → fully functional
+  
+  When partition heals:
+    [S1, S2] catch up with [S3, S4, S5] via Raft log replay
+    Any registrations on minority side that conflicted → resolved by majority
+    
+  Key: clients MUST work with stale data during partition
+    This is why client-side caching is not optional — it's survival
+
+Race 3: Zombie Instance (Registered But Dead)
+
+  Service B2 process hangs (deadlock, infinite loop) but TCP port is open
+  Health check: HTTP GET /healthz → B2 doesn't respond in 3 seconds → timeout
+  After 3 consecutive timeouts → B2 marked unhealthy → deregistered
+  
+  Window of risk: 3 checks × 10s interval = 30 seconds of routing to dead instance
+  
+  Shorter detection:
+    Passive health check: if actual request to B2 fails → immediately mark unhealthy
+    Combined: active check catches slow deaths, passive catches sudden failures
+    
+  Edge case: B2 responds to /healthz (lightweight) but fails actual requests
+    Solution: deep health check — /healthz validates DB connection, cache, etc.
+    Trade-off: deep checks are slower and can cause cascading failures
+    Recommendation: shallow check every 5s + deep check every 30s
+```
+
+### Client-Side Caching: How It Actually Works
+
+```
+Every service that calls other services maintains a LOCAL cache of SD data:
+
+┌─────────────────────────────────────────────────┐
+│  Service A (Caller)                              │
+│                                                   │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  SD Client Library (in-process)              │ │
+│  │                                               │ │
+│  │  local_cache: {                               │ │
+│  │    "payment-svc": {                           │ │
+│  │      instances: [                             │ │
+│  │        {ip: "10.0.1.5", port: 8080, healthy}, │ │
+│  │        {ip: "10.0.1.6", port: 8080, healthy}, │ │
+│  │        {ip: "10.0.1.7", port: 8080, draining} │ │
+│  │      ],                                       │ │
+│  │      version: 42,                             │ │
+│  │      last_updated: "10:05:03"                 │ │
+│  │    },                                         │ │
+│  │    "user-svc": { ... }                        │ │
+│  │  }                                            │ │
+│  │                                               │ │
+│  │  Update strategy (layered):                   │ │
+│  │  1. WATCH: blocking query to Consul/etcd       │ │
+│  │     → instant notification on change (<100ms) │ │
+│  │  2. POLL: every 30s, full refresh as backup   │ │
+│  │  3. ON-FAILURE: if request to instance fails, │ │
+│  │     → immediately refresh cache for that svc  │ │
+│  │  4. DISK: persist cache to disk file on exit  │ │
+│  │     → load from disk on start (survives restart│ │
+│  │        even if SD is down)                    │ │
+│  └─────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+
+Cache TTL vs Freshness:
+  No TTL (always trust watch): if watch disconnects silently → stale forever
+  TTL=60s (force refresh): 60s of stale data max, but 1 poll/min per client
+  Recommended: watch for real-time + TTL=120s as safety net
+  
+  At 10K services × 100 instances × 120s TTL:
+    10K / 120 = ~83 poll requests/sec to SD cluster → trivial
+```
+
+### DNS-Based vs API-Based Service Discovery
+
+```
+DNS-Based (Consul DNS, CoreDNS, AWS Cloud Map):
+  Resolve: payment-svc.service.consul → [10.0.1.5, 10.0.1.6]
+  
+  ✓ Universal: every language/framework supports DNS natively
+  ✓ No library needed: standard DNS resolution
+  ✓ Works with legacy applications (no code changes)
+  
+  ✗ DNS caching: OS/library caches DNS responses for TTL
+    TTL=5s → up to 5 seconds of stale data after instance change
+    Some clients cache DNS forever (Java!) → requires JVM flag to fix
+  ✗ No metadata: DNS returns only IP addresses, not port/tags/health
+    SRV records help (return port), but not widely supported
+  ✗ No health info: DNS can't indicate "instance is draining"
+  ✗ No load balancing: DNS round-robin is random, not load-aware
+
+API-Based (Consul HTTP, etcd, Eureka REST):
+  Call: GET /v1/health/service/payment-svc?passing=true
+  Returns: [{ip, port, tags, meta, health_status, weight}, ...]
+  
+  ✓ Rich data: port, tags, metadata, health, weight
+  ✓ Instant updates via long-poll/watch (no caching issues)
+  ✓ Enables smart routing: weighted, canary, version-based
+  ✓ Client-side load balancing with full context
+  
+  ✗ Requires client library per language (Go, Java, Python, ...)
+  ✗ More complex integration than DNS
+  ✗ Library must handle caching, retry, reconnection
+
+Recommendation:
+  Use DNS for simple cases (Kubernetes internal, static services)
+  Use API for microservices with advanced routing needs
+  Many systems use both: DNS for initial discovery, API for watch/health
+```
+
+### Health Check Strategies: The Depth Spectrum
+
+```
+Level 0: TCP Check (is the port open?)
+  connect(ip, port) → success/fail
+  ✓ Catches: process crash, port binding failure
+  ✗ Misses: application hang, dependency failure
+  Latency: < 1ms
+
+Level 1: HTTP Shallow (is the process alive?)
+  GET /healthz → 200 OK (hardcoded response)
+  ✓ Catches: process crash, HTTP server failure
+  ✗ Misses: database down, cache unavailable
+  Latency: < 5ms
+
+Level 2: HTTP Deep (are dependencies healthy?)
+  GET /healthz → checks DB connection, cache, external APIs
+  → 200 {"db": "ok", "cache": "ok", "queue": "ok"}
+  ✓ Catches: dependency failures
+  ✗ Risk: if DB is slow, health check is slow → timeout → false unhealthy
+  ✗ Risk: cascading: DB slow → all services marked unhealthy → total outage
+  Latency: 10-100ms
+
+Level 3: Liveness + Readiness (Kubernetes pattern)
+  /healthz/live: "is the process not stuck?" (restart if fails)
+  /healthz/ready: "can it handle traffic?" (remove from LB if fails)
+  
+  Example:
+    Service starting up: live=true, ready=false (don't send traffic yet)
+    Service running: live=true, ready=true (fully operational)
+    DB connection lost: live=true, ready=false (alive but can't serve)
+    Deadlocked: live=false → Kubernetes KILLS and restarts the pod
+
+Recommendation:
+  SD health check: Level 1 (shallow, every 5s) — fast, reliable, no cascade risk
+  Application readiness: Level 2 (deep, every 30s) — catch dependency issues
+  Kubernetes liveness: Level 0 or 1 — only restart if truly dead
+  
+  NEVER use deep health checks at high frequency with SD
+  (100 services × deep check every 5s = 2000 DB pings/minute from health checks alone)
+```
+

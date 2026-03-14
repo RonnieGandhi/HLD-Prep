@@ -286,3 +286,182 @@ WebTorrent: uses WebRTC data channels for peer connections
   - Use case: streaming video P2P to reduce CDN costs
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Kademlia DHT Lookup — Step-by-Step Walkthrough
+
+```
+Setup (simplified with 8-bit IDs for illustration):
+  Our node:    NodeA = 01101001
+  Target:      info_hash = 01100011  (we want peers for this torrent)
+  XOR distance: 01101001 ⊕ 01100011 = 00001010 (= 10 in decimal)
+  
+  Our routing table (K-buckets, k=8 nodes per bucket):
+    Bucket 7 (distance 128-255): [11010010, 10110101, ...]  ← far nodes
+    Bucket 6 (distance 64-127):  [01010011, ...]
+    Bucket 5 (distance 32-63):   [...]
+    Bucket 4 (distance 16-31):   [01110100, 01111001, ...]
+    Bucket 3 (distance 8-15):    [01100000, 01101110, ...]   ← closest bucket!
+    Buckets 0-2:                 [sparse — few nodes this close]
+
+  Iteration 1: Pick α=3 closest known nodes to target
+    01100000 ⊕ 01100011 = 00000011 (dist=3)  ← closest
+    01101110 ⊕ 01100011 = 00001101 (dist=13)
+    01110100 ⊕ 01100011 = 00010111 (dist=23)
+    
+    Send find_node(01100011) to all 3 in parallel (UDP)
+    
+  Iteration 2: Node 01100000 responds with ITS closest nodes:
+    [01100001, 01100010, 01100100]
+    
+    01100001 ⊕ 01100011 = 00000010 (dist=2)  ← CLOSER!
+    01100010 ⊕ 01100011 = 00000001 (dist=1)  ← EVEN CLOSER!
+    
+    Send find_node(01100011) to these new closer nodes
+    
+  Iteration 3: Node 01100010 responds:
+    [01100011]  ← This IS the target (or closest known)!
+    
+    This node (01100011) is responsible for storing peer lists
+    Send get_peers(info_hash) → receives list of peers with the torrent
+    
+  Total hops: 3 iterations = O(log₂ 256) = O(8) for 8-bit ID space
+  In real BitTorrent (160-bit IDs, 10M nodes): O(log₂ 10M) ≈ 23 hops max
+  In practice: 4-8 hops (routing tables are well-populated)
+```
+
+### Routing Table Maintenance
+
+```
+K-bucket management rules:
+
+1. On receiving ANY message from node X:
+   - Compute distance = our_id ⊕ X_id → determines bucket index
+   - If X is already in the bucket → move to tail (most recently seen)
+   - If bucket not full (< k=8 nodes) → add X to tail
+   - If bucket IS full:
+     a. Ping the LEAST recently seen node (head of list)
+     b. If it responds → keep it (prefer long-lived nodes), discard X
+     c. If it doesn't respond → evict it, add X
+   
+   Why prefer long-lived nodes?
+     Empirical observation: nodes that have been online for 1 hour
+     are likely to stay online for another hour. Fresh nodes may leave
+     in minutes. Preferring old nodes → stable routing table.
+
+2. Bucket refresh (background, every 15 minutes):
+   - For each bucket that hasn't had a lookup in 15 min:
+   - Generate a random ID within that bucket's range
+   - Perform a find_node lookup for that random ID
+   - This populates the bucket with fresh nodes
+   
+3. Node join procedure:
+   a. New node N generates random 160-bit node ID
+   b. N knows at least ONE existing node (bootstrap node, hardcoded)
+   c. N performs find_node(own_id) → discovers nodes close to itself
+   d. N's routing table fills up as responses come in
+   e. N refreshes ALL buckets → fully populated within ~1 minute
+
+4. Bucket splitting (optimization):
+   - If our OWN bucket (distance 0, closest to our ID) is full
+     AND the new node falls in our bucket → split into two buckets
+   - Allows finer granularity for nearby nodes
+   - Far buckets stay at k=8 (don't need fine granularity)
+```
+
+### Choking/Unchoking Algorithm — State Machine
+
+```
+Each peer connection has 4 boolean states:
+  am_choking:      We are choking them (not uploading)
+  am_interested:   We are interested in their pieces
+  peer_choking:    They are choking us (not uploading to us)
+  peer_interested: They are interested in our pieces
+
+Data transfer happens ONLY when:
+  We unchoke them AND they are interested → we upload to them
+  They unchoke us AND we are interested  → they upload to us
+
+State transitions:
+  ┌──────────────────────────────────────────────────────────────┐
+  │ CONNECTION ESTABLISHED                                        │
+  │  Initial state: am_choking=true, am_interested=false          │
+  │                 peer_choking=true, peer_interested=false       │
+  └──────┬───────────────────────────────────────────────────────┘
+         │
+  ┌──────▼───────────────────────────────────────────────────────┐
+  │ BITFIELD EXCHANGE                                             │
+  │  Both peers send their piece availability                     │
+  │  If they have pieces we need → send INTERESTED               │
+  │  If we have pieces they need → they send INTERESTED           │
+  └──────┬───────────────────────────────────────────────────────┘
+         │
+  ┌──────▼───────────────────────────────────────────────────────┐
+  │ EVERY 10 SECONDS: Regular Unchoke Decision                    │
+  │                                                                │
+  │  1. Rank all interested peers by their upload speed TO US     │
+  │  2. Unchoke top 4 peers (they become our upload slots)        │
+  │  3. Choke everyone else                                        │
+  │                                                                │
+  │  Result: peers who give us the most get the most back          │
+  └──────┬───────────────────────────────────────────────────────┘
+         │
+  ┌──────▼───────────────────────────────────────────────────────┐
+  │ EVERY 30 SECONDS: Optimistic Unchoke                          │
+  │                                                                │
+  │  1. Randomly pick 1 choked+interested peer                    │
+  │  2. Unchoke them (5th upload slot)                             │
+  │  3. Give them 30 seconds to prove their upload speed           │
+  │  4. At next 10s evaluation, they compete with regular slots   │
+  │                                                                │
+  │  Purpose: bootstrapping — new peers have no upload history,   │
+  │  so they'd never be unchoked without the random chance.        │
+  └──────────────────────────────────────────────────────────────┘
+
+Concrete timeline example:
+  T=0s:   PeerA joins swarm, connects to 20 peers. All choke PeerA.
+          PeerA has no pieces yet, so nobody is interested in PeerA either.
+  T=30s:  PeerB optimistically unchokes PeerA → PeerA downloads piece #42
+  T=34s:  PeerA now HAS piece #42 → announces HAVE to all peers
+          PeerC is interested in #42 → PeerC sends INTERESTED to PeerA
+  T=40s:  PeerB's 10s evaluation: PeerA uploaded 0 bytes to PeerB →
+          PeerA is choked again (lost the optimistic slot)
+  T=40s:  PeerC's 10s evaluation: PeerA uploaded piece #42 to PeerC fast →
+          PeerC unchokes PeerA as regular slot (reciprocity!)
+  T=60s:  PeerD optimistically unchokes PeerA → PeerA gets more pieces
+          PeerA now has 3 pieces, is uploading to PeerC → stable position
+  T=120s: PeerA has 15 pieces, is one of the fastest uploaders →
+          multiple peers unchoke PeerA → download speed maxes out
+
+Seeder behavior (special case):
+  Seeders have all pieces → nobody uploads TO them → can't rank by reciprocity
+  Instead: unchoke peers with fastest DOWNLOAD rate (help them finish fastest
+  so they become seeders sooner → grows total swarm upload capacity)
+```
+
+### Why Piece Size Matters: Small vs Large Pieces
+
+```
+Small pieces (256 KB):
+  ✓ Fine-grained piece selection → better rarest-first distribution
+  ✓ Faster initial upload capability (complete a piece quickly)
+  ✓ Less data wasted if piece fails hash check
+  ✗ More SHA-1 hashes in .torrent file (16 KB per piece × 16,000 pieces = 256 KB)
+  ✗ More protocol overhead (more REQUEST/PIECE messages)
+  ✗ More seeks on HDD (random access per piece)
+
+Large pieces (4 MB):
+  ✓ Smaller .torrent file
+  ✓ Less protocol overhead
+  ✓ Better sequential disk I/O
+  ✗ Slower to complete first piece (can't upload until piece complete + verified)
+  ✗ More data wasted on hash failure
+
+Industry standard: 256 KB – 2 MB (adaptive based on total file size)
+  Files < 500 MB: 256 KB pieces
+  Files 500 MB – 4 GB: 1 MB pieces
+  Files > 4 GB: 2-4 MB pieces
+```
+

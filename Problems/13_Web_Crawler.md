@@ -348,3 +348,229 @@ else:
 - Priority and changefreq hints from sitemap help with scheduling
 - Sitemaps can reference other sitemaps (sitemap index files)
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### URL Frontier: Priority + Politeness Architecture
+
+```
+The URL Frontier is NOT a simple queue. It's a two-tier system:
+
+┌─────────────────────────────────────────────────────────┐
+│                    FRONT QUEUES (Priority)                │
+│                                                           │
+│  Queue P1 (critical):  [google.com/news, bbc.com/latest] │
+│  Queue P2 (high):      [wikipedia.org/..., nytimes.com/] │
+│  Queue P3 (normal):    [example.com/about, blog.io/post] │
+│  Queue P4 (low):       [random-site.xyz/page42]          │
+│                                                           │
+│  Priority assignment:                                     │
+│    PageRank of domain → high PR = high priority           │
+│    Freshness need → news sites = high priority            │
+│    Sitemap priority hint → 0.8 = high, 0.2 = low         │
+│    Previous change rate → frequently changing = higher    │
+│                                                           │
+│  Selection: weighted random from front queues             │
+│    P1: 40% chance, P2: 30%, P3: 20%, P4: 10%            │
+└───────────────────┬─────────────────────────────────────┘
+                    │ URL selected by priority
+┌───────────────────▼─────────────────────────────────────┐
+│                    BACK QUEUES (Politeness)               │
+│                                                           │
+│  One queue PER DOMAIN (ensures per-domain rate limiting)  │
+│                                                           │
+│  Queue [google.com]:     [url1, url2, url3]              │
+│    last_fetch: 10:00:05, crawl_delay: 2s                 │
+│    → next fetch allowed: 10:00:07                        │
+│                                                           │
+│  Queue [wikipedia.org]:  [url4, url5]                    │
+│    last_fetch: 10:00:03, crawl_delay: 5s                 │
+│    → next fetch allowed: 10:00:08                        │
+│                                                           │
+│  Queue [tiny-blog.com]:  [url6]                          │
+│    last_fetch: 10:00:01, crawl_delay: 10s                │
+│    → next fetch allowed: 10:00:11                        │
+│                                                           │
+│  Worker selects: domain whose next_fetch_time <= now()    │
+│  → Dequeue one URL from that domain's back queue          │
+│  → Fetch → update last_fetch timestamp                    │
+└─────────────────────────────────────────────────────────┘
+
+Why two tiers?
+  Front queues: ensure important pages are crawled first (priority)
+  Back queues: ensure we don't hammer any single domain (politeness)
+  
+  Without back queues: high-priority domain gets 1000 requests/second
+  → Gets banned, IP blacklisted, violates robots.txt crawl-delay
+  
+  Without front queues: crawl random pages regardless of importance
+  → Waste bandwidth on low-value pages while important pages wait
+```
+
+### Crawl Execution Flow — One URL End-to-End
+
+```
+URL: "https://example.com/products/shoes"
+
+Step 1: Dequeue from frontier (0.1 ms)
+  Back queue [example.com] is eligible (last_fetch was 3s ago, delay = 2s)
+  Pop URL from queue
+
+Step 2: DNS resolution (1 ms — cached)
+  Check local DNS cache → hit: example.com → 93.184.216.34
+  Cache miss: query DNS resolver → cache for TTL (300s typical)
+  Optimization: batch DNS prefetch for all URLs in a domain's back queue
+
+Step 3: Robots.txt check (0.1 ms — cached)
+  Fetch from Redis: robots:{example.com}
+  Check if /products/shoes is allowed for our User-Agent
+  If disallowed → skip URL, log reason, dequeue next
+
+Step 4: HTTP fetch (200 ms — network)
+  Open connection (reuse connection pool for same domain)
+  Send: GET /products/shoes HTTP/1.1
+        Host: example.com
+        User-Agent: MyCrawler/1.0 (+https://mycrawler.com/about)
+  Handle redirects: follow up to 5 redirects (301, 302, 307)
+  Timeout: 30 seconds (some servers are slow)
+  Max response size: 10 MB (drop larger responses)
+
+Step 5: Content deduplication (1 ms)
+  Compute SimHash of page content
+  Check SimHash against seen-pages Bloom filter
+  If near-duplicate (Hamming distance < 3) → skip (already crawled similar page)
+  If new → add to Bloom filter, continue
+
+Step 6: Parse and extract (5 ms)
+  Parse HTML → extract:
+    - Title, meta description, canonical URL
+    - All <a href="..."> links → new URLs for frontier
+    - Structured data (JSON-LD, microdata)
+    - Language detection (for language-specific index)
+
+Step 7: Store content (10 ms)
+  Write to S3: { url, content, headers, crawled_at, content_hash }
+  Key: content_hash (deduplication at storage level)
+
+Step 8: Process extracted URLs (1 ms)
+  For each extracted URL:
+    Normalize: lowercase, remove fragment, resolve relative
+    Check Bloom filter: already seen?
+    If new → add to frontier with priority score
+    
+  Update domain crawl stats:
+    INCR crawled:{domain} — track total pages per domain
+    If crawled > 1M → stop crawling this domain (trap protection)
+
+Step 9: Update back queue timestamp
+  Set last_fetch_time = now() for domain example.com
+  Next URL from this domain eligible after crawl_delay
+
+Total time per URL: ~220 ms (dominated by network fetch)
+Throughput per worker: ~4.5 URLs/sec
+1000 workers × 4.5 = ~4,500 URLs/sec ≈ ~390M pages/day
+Target: 1B pages/day → need ~2,500 workers
+```
+
+### Distributed Coordination: Domain-Sharded Architecture
+
+```
+Problem: 1000 crawler workers fetching URLs from the same frontier
+  → Multiple workers might fetch from the same domain simultaneously
+  → Violates politeness (combined rate exceeds crawl-delay)
+
+Solution: Shard domains across workers using consistent hashing
+
+  domain_shard = hash(domain) % num_workers
+  
+  Worker 0: responsible for domains hashing to 0
+    [google.com, stackoverflow.com, ...]
+  Worker 1: responsible for domains hashing to 1
+    [wikipedia.org, amazon.com, ...]
+  ...
+  Worker 999: responsible for domains hashing to 999
+  
+  Each worker maintains its OWN back queues for its assigned domains
+  → No coordination needed for politeness (single writer per domain)
+  → No distributed locks for rate limiting
+
+Feeding URLs to workers:
+  Kafka topic: discovered-urls (partitioned by domain hash)
+  When any worker discovers new URLs:
+    Publish to Kafka with key = domain
+    Kafka routes to correct partition → correct worker consumes
+  
+  Worker consumes URLs for its assigned domains
+  → Checks Bloom filter (shared Redis, or local + periodic sync)
+  → Adds to local frontier if new
+
+Rebalancing on worker failure:
+  Worker 42 dies → its domains temporarily uncrawled
+  Kafka consumer group rebalances → another worker inherits partition 42
+  New worker loads domain state (last_fetch times) from Redis
+  Resumes crawling within ~30 seconds
+
+Advantages over centralized frontier:
+  ✓ No single point of failure (no master)
+  ✓ Linear scalability (add workers → more domains handled)
+  ✓ Politeness guaranteed by design (single writer per domain)
+  ✗ Hot domains (google.com) assigned to one worker → uneven load
+  Mitigation: split hot domains into sub-crawlers (by URL path prefix)
+```
+
+### BFS vs DFS vs Priority-Based Crawling
+
+```
+BFS (Breadth-First):
+  Crawl all pages at depth 1, then depth 2, then depth 3...
+  ✓ Discovers important pages early (homepage → main sections)
+  ✗ May waste bandwidth on low-value pages at same depth
+  ✗ Doesn't account for page importance
+  
+DFS (Depth-First):
+  Follow links deep into a site before backtracking
+  ✓ Less memory (only current path in stack)
+  ✗ Gets trapped in deep page hierarchies
+  ✗ May never reach important pages on other domains
+  
+Priority-Based (this design) ⭐:
+  Score each URL by importance, crawl highest-scored first
+  Score = α × PageRank(domain) + β × depth_penalty + γ × freshness_need
+  
+  ✓ Most important pages crawled first
+  ✓ Adaptive: can reprioritize based on discovery
+  ✗ More complex (priority queue management)
+  
+  Practical: hybrid approach
+    Start with BFS from seeds (discover site structure)
+    Switch to priority-based after initial crawl (focus on important pages)
+    Use DFS within a domain (follow sitemap structure)
+```
+
+### URL Normalization: Why It Matters
+
+```
+The same page accessible via many URLs:
+  https://example.com/page
+  https://Example.COM/page          → lowercase host
+  https://example.com/page/         → trailing slash
+  https://example.com/page?a=1&b=2  → query param order
+  https://example.com/page?b=2&a=1  → same params, different order
+  http://example.com/page           → different scheme
+  https://example.com/./page/../page → path normalization
+
+Without normalization: crawl same page 7 times → wasted bandwidth
+With normalization: all resolve to https://example.com/page
+
+Normalization rules (applied before Bloom filter check):
+  1. Lowercase scheme and host
+  2. Remove default port (:80 for HTTP, :443 for HTTPS)
+  3. Remove trailing slash (unless root /)
+  4. Sort query parameters alphabetically
+  5. Remove tracking parameters (utm_source, fbclid, gclid)
+  6. Resolve path (remove /. and /..)
+  7. Decode unreserved percent-encoded characters (%41 → A)
+  8. Prefer HTTPS canonical URL (follow <link rel="canonical">)
+```
+
