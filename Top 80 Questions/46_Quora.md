@@ -302,3 +302,150 @@ For Q&A: MySQL wins. The data is inherently relational,
 consistency matters, and Vitess solves scaling.
 ```
 
+### Answer-to-Answer (A2A) Request Routing
+
+```
+"Request Alice to answer this question" — how to match questions to experts?
+
+Algorithm:
+  1. Extract topic tags from the question (NLP / manual tags)
+  2. Find users who are experts in those topics:
+     - Wrote answers in that topic with high Wilson scores
+     - Have "topic credentials" (self-declared + community endorsed)
+     - Are currently active (last active < 7 days)
+  3. Rank by: expertise_score × activity_recency × response_rate
+  4. Show top 5 suggested experts to the questioner
+  5. On request: send notification to the expert
+
+Rate limiting: Max 3 A2A requests per question, 10 per day per user
+Expert can decline (or ignore) without penalty
+
+Implementation:
+  topic_experts:{topic_id} → Sorted Set (score = expertise_score)
+  Updated weekly: Spark job aggregates answer quality per topic per user
+```
+
+### Question Deduplication — "Has This Already Been Asked?"
+
+```
+User types: "What is the best programming language for beginners?"
+Similar existing questions:
+  "What programming language should beginners learn?"
+  "Best first programming language to learn?"
+  
+Detection pipeline:
+  1. On question submit: compute sentence embedding (BERT/sentence-transformers)
+  2. ANN search against index of existing question embeddings (Faiss/Milvus)
+  3. If top match has similarity > 0.85 → suggest: "Similar question already exists"
+  4. User can: merge into existing question OR confirm theirs is distinct
+  
+If merged: new question redirects to existing → concentrates answers
+  → Better than 50 identical questions with 1 answer each
+
+Storage: question_embeddings table in Milvus (768-dim vectors, 500M entries)
+  Search time: ~10ms for top-5 similar questions
+```
+
+### Content Quality and Moderation
+
+```
+Quality signals per answer:
+  - Length: very short answers (< 50 chars) flagged as low-quality
+  - Formatting: proper paragraphs, bullet points → higher quality score
+  - References: contains links/citations → credibility boost
+  - Author expertise: author's track record in this topic
+  - Plagiarism check: compare against existing answers (SimHash)
+
+Moderation pipeline:
+  1. Automated: spam classifier (logistic regression on text features)
+     → catches 95% of spam (link farms, promotional content)
+  2. Community: users flag content → if 3+ flags → human review queue
+  3. Topic-specific moderators: volunteer power users per topic
+  4. Appeals: author can appeal removal → reviewed by different moderator
+  
+Collapse vs Delete:
+  Low-quality but not rule-breaking → "collapsed" (hidden by default, expandable)
+  Rule-violating (spam, hate) → deleted entirely
+  This preserves free expression while maintaining quality
+```
+
+### Search Ranking — Finding Answers Across 500M Questions
+
+```
+User searches: "best database for analytics"
+
+Pipeline:
+  1. Elasticsearch query: match title + body with BM25 relevance
+  2. Re-rank results using engagement signals:
+     search_score = w1 × text_relevance (BM25)
+                  + w2 × answer_quality (avg Wilson score of answers)
+                  + w3 × view_count (popularity)
+                  + w4 × recency (newer questions slightly boosted)
+                  + w5 × follow_count (more followed = more relevant)
+  3. Filter: exclude closed/merged/spam questions
+  4. Return top 20 results with best-answer snippet
+
+  Elasticsearch index per question:
+    { title (boost 2×), body (boost 1×), topics (boost 1.5×),
+      top_answer_text (boost 0.5×) }
+  
+  Index update: via CDC (Debezium) from MySQL → Kafka → ES consumer
+  Lag: < 30 seconds for new questions to be searchable
+
+  Autocomplete: As user types in search bar, show matching questions
+    → Prefix query on Elasticsearch → return top 5 matches
+    → Same autocomplete used for question dedup (suggest before posting)
+```
+
+### Spaces (Communities) — Topic-Based Groups
+
+```
+Spaces = user-created communities around topics (like subreddits for Q&A)
+
+Data model:
+  spaces table: (space_id, name, description, owner_id, member_count, rules)
+  space_members: (space_id, user_id, role: admin|moderator|member)
+  space_questions: (space_id, question_id) — many-to-many
+  
+Features:
+  - Questions can be posted to a Space (shown in Space feed)
+  - Space admins set posting rules (topic guidelines, quality bar)
+  - Space-specific moderation (admins + moderators)
+  - Space feed: questions from the Space, ranked by engagement + recency
+  
+Feed generation:
+  User follows 10 Spaces → aggregate latest questions across all Spaces
+  Ranking: same Wilson-score based quality ranking within each Space
+  Cache: space_feed:{space_id} = [question_ids] (TTL: 5 min)
+```
+
+### Edit History and Collaborative Editing
+
+```
+Answers can be edited (like Wikipedia-lite)
+
+Edit tracking:
+  answer_revisions table: (answer_id, version, body, edited_by, edited_at, edit_summary)
+  On edit: INSERT new revision, UPDATE current answer body, 
+           notify followers: "Alice edited her answer to..."
+
+  Show: "Edited 2 hours ago" with "View edit history" link
+  Diff view: side-by-side comparison of two revisions (use diff algorithm)
+  
+  Permissions:
+    Original author: can always edit their own answer
+    Suggested edits: other users can SUGGEST edits → author approves/rejects
+    This prevents vandalism while enabling collaborative improvement
+
+Author credibility score:
+  Computed per-topic:
+    credibility = w1 × total_upvotes_in_topic
+                + w2 × answer_count_in_topic
+                + w3 × avg_wilson_score_in_topic
+                + w4 × credentials_verified (e.g., "PhD in Computer Science")
+  
+  Displayed as: "Top Writer in Databases" badge
+  Updated: weekly batch job (Spark aggregation)
+  Used in: answer ranking, A2A suggestions, feed curation
+```
+

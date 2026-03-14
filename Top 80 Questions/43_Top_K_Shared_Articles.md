@@ -219,9 +219,80 @@ GROUP BY article_id, region, category, hour;
 | **Article metadata missing** | Async enrichment; display URL if title unavailable |
 | **Spam shares** | Rate limit per user (max 100 shares/hour); bot detection |
 
+### Race Conditions and Scale Challenges
+
+#### 1. Viral Article — Single Key Hot Spot
+
+```
+One article goes viral → 1M shares in 10 minutes → all INCR operations 
+hit ONE Flink key/partition → backpressure on that partition
+
+Solutions:
+  a. Pre-aggregate at service layer:
+     Each API server buffers share counts in-memory for 1 second
+     Flush batch count to Kafka: {article_id: "art-123", count: 342}
+     Flink receives pre-aggregated batches → 1000× fewer events per article
+     
+  b. Kafka partition by article_id hash:
+     Hot article goes to ONE partition → consumer for that partition overloaded
+     Fix: Use sub-keys → partition by hash(article_id + random(0..7))
+     Flink: aggregate across sub-keys in a second stage
+```
+
+#### 2. Late-Arriving Shares — Window Accuracy
+
+```
+Share event from mobile user arrives 10 minutes late.
+5-minute pane has already closed → event counted in wrong pane.
+
+Impact: Article temporarily ranked slightly lower than it should be.
+
+Flink watermark: allow 5 minutes of lateness.
+Events beyond 5 min late → side output → counted in NEXT pane.
+Batch reconciliation (Spark, hourly): re-counts from ClickHouse → fixes any drift.
+
+Acceptable: For "top shared articles" display, ±5% accuracy is fine.
+Users see "1.5K shares" not "1,523 shares" → rounding hides errors.
+```
+
+#### 3. Click-Bait and Spam Article Filtering
+
+```
+Problem: Bot network shares the same scam article 500K times → ranks #1
+
+Detection signals:
+  1. Share source diversity: if >80% of shares from <50 unique users → spam
+  2. Article domain reputation: known spam domains get score penalty
+  3. Share velocity anomaly: organic articles grow gradually;
+     spam jumps 0→100K in 2 minutes (step function)
+  4. User account age: if >50% of sharers have accounts <7 days old → bot
+
+Action: Apply penalty multiplier (0.1×) or suppress entirely from rankings
+Flagged articles go to human review queue.
+```
+
 ---
 
-## 8. Deep Dive: Engineering Trade-offs
+## 8. Additional: URL Deduplication for Articles
+
+```
+Same article shared from different URLs:
+  https://example.com/article/123
+  https://example.com/article/123?utm_source=twitter
+  https://t.co/abc123 (shortened URL)
+  https://www.example.com/article/123/ (trailing slash, www prefix)
+
+All should count as shares of the SAME article.
+
+URL normalization pipeline:
+  1. Expand shortened URLs (follow redirects: t.co → example.com/...)
+  2. Strip tracking params (utm_source, utm_medium, fbclid, etc.)
+  3. Normalize: lowercase, remove trailing slash, remove www prefix
+  4. Compute canonical_url_hash = SHA256(normalized_url)
+  5. Use canonical_url_hash as the article_id for counting
+
+Cache: resolved shortened URLs in Redis (TTL: 24h) to avoid repeated HTTP follows
+```
 
 ### Exact vs Approximate Top-K
 
@@ -264,5 +335,81 @@ Stream (Flink) ⭐:
 
 Best: Flink for real-time (good enough accuracy) + hourly Spark job to reconcile exact counts
   Flink results shown to users; Spark results used for analytics and ground truth.
+```
+
+### Article Metadata Enrichment — Making Rankings Useful
+
+```
+Top-K ranking shows article IDs — users need to see title, thumbnail, publisher.
+
+Enrichment pipeline:
+  1. On first share of a new URL → fetch metadata asynchronously:
+     a. HTTP GET the URL → parse HTML
+     b. Extract Open Graph tags: og:title, og:image, og:description, og:site_name
+     c. If no OG tags → fallback to <title> tag + first image
+     d. Store in Redis: article_meta:{canonical_hash} = {title, image, publisher, url}
+     e. Persist to MySQL for durability
+  
+  2. TTL: article metadata cached for 24 hours (titles rarely change)
+  
+  3. Edge case: URL returns 404 or paywall
+     → Store placeholder: {title: "Article from example.com", image: default_thumbnail}
+     → Retry metadata fetch every 6 hours
+
+  4. Top-K API response includes enriched metadata:
+     { rank: 1, url: "...", title: "AI Breakthrough...", 
+       image: "...", publisher: "NYTimes", share_count: 152340 }
+```
+
+### Virality Detection — Alerting on Emerging Viral Content
+
+```
+Use case: News editors want to know when an article starts going viral
+
+Detection algorithm:
+  Track share velocity per article (shares per minute, sliding window)
+  
+  Virality stages:
+    Stage 1: "Emerging" — velocity > 50 shares/min (normal is < 5)
+    Stage 2: "Viral"    — velocity > 500 shares/min
+    Stage 3: "Mega-viral" — velocity > 5000 shares/min
+  
+  On stage transition → publish Kafka event:
+    { article_id, stage: "viral", velocity: 523, total_shares: 15234 }
+  
+  Consumers:
+    - Editorial dashboard: highlight emerging stories for journalists
+    - Push notification: alert publishers when their article goes viral  
+    - CDN pre-warming: push article to edge caches before traffic surge
+    - Trending integration: boost article in trending section
+
+Why separate from Top-K?
+  Top-K answers "what's most shared overall" (total volume)
+  Virality answers "what's GROWING fastest right now" (velocity)
+  An old article with 10M total shares is NOT viral (stable)
+  A new article with 5K shares but gaining 500/min IS viral
+```
+
+### Share Attribution Chain — Who Started the Viral Spread?
+
+```
+Article shared 1M times. Who was the "patient zero" that started it?
+
+Attribution chain:
+  Share 1: Alice shares on Twitter → 100 followers see it
+  Share 2: Bob (Alice's follower) reshares → 5000 followers see it
+  Share 3: Carol (Bob's follower) reshares → 100K followers see it → goes viral
+
+  Tree structure:
+    Alice (original)
+      └── Bob (reshare from Alice)
+           ├── Carol (reshare from Bob)  ← this is where it went viral!
+           └── Dave (reshare from Bob)
+
+  Tracking: Each share event includes referrer_user_id (who they got it from)
+  Storage: ClickHouse table with parent_share_id column
+  
+  Analytics: "This article went viral because Carol (500K followers) shared it"
+  Value: Publishers pay for this insight → monetization opportunity
 ```
 

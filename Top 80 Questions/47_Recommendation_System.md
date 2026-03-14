@@ -368,3 +368,129 @@ Hybrid ⭐ (Netflix/TikTok approach):
 
 **Netflix uses Hybrid**: Multiple candidate generators (collaborative, content, trending, editorial) → single DNN ranker → business rules re-ranker.
 
+### A/B Testing — How to Validate Model Changes
+
+```
+Every recommendation model change MUST be A/B tested before full rollout.
+
+Setup:
+  Control group (50%): current production model (v14)
+  Treatment group (50%): new candidate model (v15)
+  
+  Users deterministically assigned: hash(user_id) % 100 < 50 → control
+  Assignment is STICKY (same user always in same group for experiment duration)
+
+Key metrics:
+  1. Primary: Watch time / session (did users watch MORE content?)
+  2. Secondary: CTR (click-through rate on recommendations)
+  3. Guardrail: Retention (did users come back next day?)
+  4. Counter-metric: Diversity (did we accidentally create filter bubble?)
+  
+Duration: Minimum 7 days (to capture weekly seasonality)
+Statistical significance: p < 0.05, minimum detectable effect = 0.5%
+
+Infrastructure:
+  Experiment config service → decides which model version serves each user
+  Feature flags: {experiment_id: "rec_v15", model_version: "v15", traffic: 50%}
+  Metrics pipeline: Flink aggregates per-experiment engagement metrics
+  Dashboard: Real-time experiment results (like Optimizely/LaunchDarkly)
+
+Common pitfall: "Engagement trap"
+  Model optimizes for clicks → shows clickbait → high CTR but low satisfaction
+  Solution: Optimize for COMPLETION rate, not just clicks
+  "Did the user actually enjoy the content?" > "Did the user click?"
+```
+
+### Model Serving Infrastructure — GPU Inference at Scale
+
+```
+Ranking 5K candidates per request requires DNN inference.
+At 100K requests/sec → 500M (user, item) pair scores per second.
+
+Architecture:
+  Model: TensorFlow SavedModel / PyTorch TorchScript
+  Serving: TensorFlow Serving / Triton Inference Server
+  Hardware: GPU instances (NVIDIA A100) for batch inference
+  
+  Batching ⭐: Don't score one (user, item) pair at a time.
+    Batch 5K items into ONE forward pass through the DNN.
+    GPU parallelism: 5K scores in ~50ms (vs 5K × 1ms = 5s sequential)
+  
+  Model loading: Keep model in GPU memory (hot), reload on new version deploy
+  Canary deploy: New model version serves 1% traffic for 1 hour
+    If metrics OK → ramp to 10% → 50% → 100%
+    If metrics degrade → auto-rollback to previous version
+  
+  Fallback: If GPU serving is down → fallback to CPU-based simple model
+    (e.g., popularity-based ranking, no personalization)
+    Degraded but functional > completely broken
+
+  Latency budget:
+    Feature fetch: 20ms (Redis)
+    Candidate generation: 30ms (ANN search)
+    Ranking inference: 50ms (GPU batch)
+    Re-ranking: 10ms (business rules)
+    Total: ~110ms (well within 200ms target)
+```
+
+### Real-Time Feature Pipeline — Closing the Feedback Loop
+
+```
+User watches a horror movie at 9 PM. 
+  At 9:01 PM, recommendations should start showing more horror.
+  But the batch pipeline only updates every 30 minutes!
+
+Real-time feature update path:
+  User action → Kafka (user-events) → Flink →
+    1. Update user embedding: append latest item to watch history
+       → recompute user embedding (lightweight, < 5ms)
+       → write to Redis: user:{uid}:embedding
+    2. Update engagement counters:
+       INCR user:{uid}:genre_watch_count:horror
+    3. Update session-level features:
+       LPUSH user:{uid}:session_history {item_id}
+  
+  Next recommendation request (at 9:01 PM):
+    Read updated embedding → ANN search returns horror-adjacent candidates
+    Ranking model uses updated genre counts → horror movies score higher
+    → User sees horror recommendations within 60 seconds of watching
+
+  This is the "real-time feature" approach — no model retraining needed.
+  The same model, fed with updated features, produces different results.
+
+Feature freshness tiers:
+  Real-time (< 1 min): last watched, session history, time of day
+  Near-real-time (< 30 min): updated embeddings, genre preferences
+  Batch (daily): user demographics, long-term preferences, social graph
+```
+
+### Feedback Loops and Position Bias — The Hidden Dangers
+
+```
+Problem 1: Position bias
+  Items shown at position 1 get 10× more clicks than position 5.
+  Model trained on click data → learns "position 1 items are good"
+  → Ranks same items at top forever → no exploration of new content.
+  
+  Solution: Remove position feature during training.
+  At training time: the model should learn ITEM quality, not position.
+  At serving time: items ranked by quality, position is just display order.
+
+Problem 2: Popularity feedback loop
+  Popular items → recommended more → more engagement → even more popular
+  New/niche items → never recommended → no engagement → stay buried
+  
+  Solution: Exploration budget (10% random, underexposed items)
+  + Position de-biasing: Train model with inverse propensity weighting
+    Weight each training example by 1/P(shown) 
+    → Under-exposed items get higher weight → model learns their true quality
+
+Problem 3: "Rabbit hole" effect
+  User watches one conspiracy theory video → algorithm feeds more → radicalization
+  
+  Solution: Content diversity enforcement in re-ranking
+    Max 3 videos from same category in a row
+    After 5 videos in same category → inject content from other categories
+    Hard cap: no single category > 40% of any user's feed
+```
+

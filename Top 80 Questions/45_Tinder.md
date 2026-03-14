@@ -341,3 +341,76 @@ PostGIS / R-tree:
 For Tinder: Redis GeoSet is the simplest and fastest choice.
 ```
 
+### Already-Swiped Tracking — Bloom Filter for Memory Efficiency
+
+```
+Problem: User has swiped on 50K profiles over 6 months.
+  swiped:{user_id} SET in Redis = 50K × 16 bytes = 800 KB per user
+  200M DAU × 800 KB = 160 TB just for swipe dedup → TOO EXPENSIVE
+
+Bloom filter approach ⭐:
+  BF per user: 50K entries, 0.1% false positive rate → 72 KB per user
+  200M DAU × 72 KB = 14 TB → 10× reduction
+
+  False positive impact: BF says "already swiped" but actually not →
+    User never sees that profile → missed opportunity, but harmless
+    At 0.1% rate → 1 in 1000 profiles incorrectly filtered → acceptable
+
+  Implementation:
+    BF.ADD swiped_bf:{user_id} {target_user_id}
+    BF.EXISTS swiped_bf:{user_id} {candidate_id}
+    → If exists → filter out from deck
+    → If not exists → show in deck (guaranteed correct)
+
+  Cassandra stores exact swipe history for auditing / undo feature.
+  Bloom filter is a READ optimization, not the source of truth.
+```
+
+### Profile Boost — Temporarily Increasing Visibility
+
+```
+Premium feature: "Boost" places your profile at the top of nearby users' decks
+
+Implementation:
+  On boost activation:
+    SET boost:{user_id} {expiry_timestamp} EX 1800  (30-minute boost)
+    ZADD boosted_users:{geohash_prefix} {score=999} {user_id}
+
+  During deck generation for nearby users:
+    1. First: pull boosted users in this geo area (ZREVRANGE boosted_users:...)
+    2. Then: normal ranked candidates
+    3. Mix: 1 boosted profile per 5 normal profiles
+    
+  Revenue model: ~$5 per boost → at 10M boosts/month = $50M/month
+  
+  Anti-abuse: Max 1 boost per 12 hours, no stacking.
+  Fairness: If too many boosts in one area → dilute effect (each boost gets
+  fewer guaranteed views → prevents boost-only decks)
+```
+
+### Safety — Photo Verification and Reporting
+
+```
+Problem: Catfishing (fake photos), harassment, underage users
+
+Photo verification:
+  1. User takes a real-time selfie matching a specific pose
+  2. ML model compares selfie to profile photos (face matching)
+  3. If match confidence > 0.9 → verified badge on profile
+  4. Not face recognition (privacy) → just "does this face match the photos?"
+
+Reporting flow:
+  User reports another user → {reporter, reported, reason, evidence}
+  1. Auto-actions based on report count:
+     5 reports → profile temporarily hidden from discovery
+     10 reports → account suspended pending human review
+  2. Severe reports (harassment, threats) → immediate suspension
+  3. Human review SLA: 24 hours
+  4. Repeat offenders → permanent ban + device fingerprint ban
+
+Underage detection:
+  Age from profile (self-reported) → if < 18 → cannot create account
+  ML age estimation on profile photos → flag if estimated < 18
+  Flagged accounts require ID verification before publishing profile
+```
+

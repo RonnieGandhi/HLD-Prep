@@ -261,6 +261,59 @@ Fix: Sub-partition hot regions (US-east, US-west, US-central)
   Or: key by (region, topic_hash % 100) → 100 sub-partitions
 ```
 
+#### Stale Trend — Topic That Should Have Decayed But Didn't
+
+```
+"#MondayMotivation" spikes every Monday morning (expected).
+But if baseline hasn't been updated in 2 weeks (Spark job failed):
+  → Old baseline is too low → appears as trending every Monday → wrong!
+
+Detection: Monitor baseline freshness
+  If baseline is > 14 days old → use conservative fallback:
+    fallback_baseline = max(V_baseline, V_current × 0.5)
+    This prevents anything from appearing as more than 2× "normal"
+
+Fix: Alert on Spark baseline job failures; auto-retry with backoff
+```
+
+#### Flink Checkpoint Recovery — Events Replayed Twice
+
+```
+Flink checkpoints at T=10:00 (offset=1000)
+Processes events 1001-1500
+Crashes at T=10:03 before next checkpoint
+
+Recovery: restart from offset 1000 → events 1001-1500 replayed!
+  → Counts for topics in those events are DOUBLED
+
+Solution: Flink's exactly-once guarantee with Kafka transactions
+  Flink writes to Kafka output topic + commits checkpoint atomically
+  If crash → events re-consumed but duplicates detected via transaction
+  
+  For Redis output: idempotent ZADD (same score overwritten, not doubled)
+  For counting: use Flink's managed state (restored from checkpoint, not Redis)
+```
+
+#### Trend Suppression — Sensitive Content
+
+```
+Breaking news: mass shooting → topic trends instantly
+Problem: Surfacing this as "trending" feels exploitative
+
+Content sensitivity pipeline:
+  1. Keyword blocklist: certain terms auto-suppressed from trending
+  2. Sentiment analysis: if topic sentiment is overwhelmingly negative
+     AND contains sensitive keywords → flag for review
+  3. Human review: on-call Trust & Safety team can manually suppress trends
+  4. Editorial override: trending list can be manually curated during crises
+  
+Twitter's approach: "Trending with context"
+  Instead of just "#shooting" → show "Mass shooting at X: law enforcement responding"
+  Adds responsible context rather than raw hashtag
+```
+  Or: key by (region, topic_hash % 100) → 100 sub-partitions
+```
+
 ---
 
 ## 8. Deep Dive: Engineering Trade-offs
@@ -289,3 +342,61 @@ Hybrid "Sketch + Promote" ⭐:
 | **Best for** | Complex event processing | Batch+stream hybrid | Simple pipelines |
 
 Choose Flink: needs sliding windows, low latency, complex per-key state.
+
+### Personalized Trends
+
+```
+Standard trends: Top 20 for a region (same for everyone in US)
+Personalized trends: Mix in topics relevant to the user's interests
+
+Implementation:
+  User interests = topics they follow + topics they engage with
+  For each trending topic:
+    relevance = cosine_similarity(topic_embedding, user_interest_embedding)
+  Final_rank = w1 × velocity + w2 × relevance
+  
+  Example: User follows #Tech and #AI
+    #WorldCup trending (velocity=15, relevance=0.1) → final=1.6
+    #GPT5Release trending (velocity=5, relevance=0.9) → final=2.3
+    → User sees #GPT5Release higher (personalized!)
+
+  Pre-computed: user interest embeddings updated daily via Spark
+  Real-time: re-rank top 50 regional trends using user embedding (< 10ms)
+```
+
+### Trend Category Auto-Classification
+
+```
+Categorize trending topics automatically: Sports, Politics, Entertainment, Tech, etc.
+
+Approach:
+  1. Named Entity Recognition (NER): "Taylor Swift" → entity type = PERSON
+  2. Topic model: LDA / BERTopic on sample tweets mentioning the topic
+  3. Knowledge graph lookup: "Taylor Swift" → Wikidata → category = musician
+  4. Hashtag taxonomy: #WorldCup → manually curated mapping → Sports
+  
+  Fallback: If no category detected → "Trending" (uncategorized)
+  
+  Used for: filtering ("show only Sports trends"), display context
+```
+
+### Multi-Language Trend Merging
+
+```
+Same event trending in multiple languages:
+  "#CopaDelMundo" (Spanish), "#WorldCup" (English), "#ワールドカップ" (Japanese)
+
+Should these merge into ONE trend or stay separate?
+
+Approach: Entity-based merging
+  1. NER extracts entities: all three map to entity "FIFA World Cup 2026"
+  2. Merge counts across language variants
+  3. Display: use the user's language variant but aggregate volume
+
+Without merging: Same event appears 3 times in trending → redundant
+With merging: One entry showing "2.3M tweets" (across all languages) → cleaner
+
+Implementation: entity_id as the trend key, not the raw hashtag text
+  Flink: group by entity_id (resolved via a pre-built entity dictionary)
+```
+

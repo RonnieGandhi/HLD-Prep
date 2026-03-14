@@ -339,3 +339,103 @@ Best: Pre-computed feed + on-demand refresh when user exhausts cached feed
   Client pre-fetches next batch before current batch runs out.
 ```
 
+### Content Moderation Pipeline — The Trust & Safety Layer
+
+```
+Every uploaded video MUST be moderated before reaching users.
+
+Pipeline (in transcoding workers):
+  Stage 1: Automated ML classifiers (< 5 seconds)
+    • Nudity/sexual content detection (image classifier on keyframes)
+    • Violence/gore detection
+    • Hate speech detection (text classifier on captions + OCR on video text)
+    • Copyright music detection (audio fingerprint → match database)
+    • Spam/scam detection (metadata patterns)
+    
+    Result: confidence score [0, 1] per category
+    
+  Stage 2: Decision routing
+    confidence > 0.95 → AUTO-REJECT (block immediately, notify creator)
+    confidence 0.7-0.95 → HUMAN REVIEW QUEUE (hold, don't publish)
+    confidence < 0.7 → AUTO-APPROVE (publish, but monitor)
+    
+  Stage 3: Human review (for borderline cases)
+    Queue: 10K-50K videos/day need human review
+    SLA: review within 2 hours
+    Reviewers: trained content moderators with escalation to policy team
+    
+  Stage 4: Post-publish monitoring
+    Published videos continuously monitored via user reports
+    If video gets > 10 reports → auto-deprioritize in recommendations
+    If > 50 reports → remove from recommendations, flag for review
+    
+  Appeals: Creator can appeal removal → second human review
+  
+  False positive rate target: < 1% (wrongly removed)
+  False negative rate target: < 0.1% (harmful content reaching users)
+```
+
+### Engagement Signals — What the Algorithm REALLY Optimizes
+
+```
+TikTok's "secret sauce" is the engagement signal hierarchy:
+
+  Signal 1: Watch completion rate (MOST important)
+    Did the user watch the full video? 2nd loop? 3rd loop?
+    Completion_rate = watch_time / video_duration
+    If completion_rate > 1.0 → user LOVED it (rewatched)
+    This signal is 10× more predictive than likes
+    
+  Signal 2: Share (very strong positive)
+    Sharing = "I want my friends to see this"
+    Strongest explicit signal of quality
+    
+  Signal 3: Comment (strong positive)
+    Even negative comments = engagement
+    Videos with high comment rate get boosted
+    
+  Signal 4: Like (moderate positive)
+    Easy action, high frequency → somewhat noisy signal
+    
+  Signal 5: Follow after watching (strong positive)
+    "This creator's content is consistently good"
+    
+  Signal 6: Skip / swipe away (negative)
+    Watch < 3 seconds then swipe → strong negative signal
+    
+  Signal 7: "Not interested" (explicit negative)
+    User explicitly marks → downweight similar content heavily
+
+Training data:
+  Every user session generates training examples:
+    (user_features, video_features) → {completed, liked, shared, skipped}
+  Model retrained daily with latest data → adapts to trends within 24 hours
+```
+
+### CDN Optimization — Serving 225 PB/Day
+
+```
+225 PB/day = 2.6 GB/sec average, peaks at 5+ GB/sec
+
+Optimization strategies:
+
+  1. HLS Adaptive Bitrate:
+     360p (0.5 Mbps), 480p (1.5 Mbps), 720p (3 Mbps), 1080p (5 Mbps)
+     Client starts at lowest → upgrades based on bandwidth
+     Saves bandwidth: 60% of views are on mobile → 480p sufficient
+     
+  2. Predictive pre-warming:
+     When video starts going viral (velocity > threshold):
+       → Push to CDN edge nodes in likely regions BEFORE requests arrive
+       → Avoid origin pull thundering herd
+     
+  3. Short video = small files = high cache hit rate:
+     30-second video at 720p = ~5 MB
+     CDN edge server with 1 TB cache → holds 200K videos
+     Top 200K videos cover 80%+ of views → 80% cache hit rate
+     
+  4. Range requests for seek:
+     HLS segments: 2-second chunks
+     User scrolls to middle → only fetch that segment → low TTFB
+```
+

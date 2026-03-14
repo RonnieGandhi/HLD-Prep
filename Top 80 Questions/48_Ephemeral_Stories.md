@@ -344,3 +344,107 @@ Application-level deletion:
 For stories: Cassandra TTL + TWCS compaction is the best fit.
 ```
 
+### Close Friends — Audience-Restricted Stories
+
+```
+"Close Friends" list: a user-curated list of ~50 people who see private stories.
+
+Data model:
+  Redis SET: close_friends:{uid} = {friend_id_1, friend_id_2, ...}
+  MySQL backup: close_friends table (user_id, friend_id) for persistence
+
+Story posting with audience = "close_friends":
+  1. Story metadata includes: audience = "close_friends"
+  2. On story tray request: for each followed user with active stories:
+     a. Fetch story audience type
+     b. If audience = "close_friends" → check: SISMEMBER close_friends:{author} {viewer}
+     c. If viewer IS in close friends → show story with green ring (special indicator)
+     d. If viewer is NOT → skip this story entirely (invisible)
+
+Privacy guarantee:
+  - The viewer NEVER knows they're NOT in someone's close friends
+  - They simply don't see the story — no "you're not in their close friends" message
+  - Close friends list is completely private to the author
+
+Race condition: Author removes Bob from close friends WHILE Bob is viewing the story
+  Solution: Permission check happens at story FETCH time, not display time
+  If removed → next story tap will skip remaining close-friends-only stories from that author
+  Already-viewed content: unavoidable (they already saw it before removal)
+```
+
+### Story Tray Ordering — Who Shows First?
+
+```
+User opens Instagram → story tray at top → which stories appear first?
+
+Ranking algorithm:
+  For each followed user with active stories:
+    score = w1 × has_unviewed_stories      (binary: 1 if unviewed, 0 if all viewed)
+          + w2 × interaction_score          (DMs, likes, profile visits with this user)
+          + w3 × recency_of_latest_story    (more recent = higher)
+          - w4 × stories_already_viewed_today (fatigue: shown too many already = lower)
+          + w5 × is_close_friend            (boost for close friends)
+
+  Result:
+    Position 1-3: Unviewed stories from closest friends
+    Position 4-10: Unviewed stories from other followed users
+    Position 11+: Viewed stories (dimmed ring) sorted by interaction score
+
+  Pre-computation:
+    interaction_score: computed offline (Spark, daily) from DM frequency, 
+    comment exchanges, profile visits → stored in Redis hash
+    HSET interaction_scores:{uid} {other_uid} 0.85
+
+  Caching:
+    Story tray order cached: tray:{uid} = [author_ids_ordered] (TTL: 5 min)
+    Invalidated when: user views a story, new story posted by followed user
+```
+
+### Story Analytics — Creator Insights
+
+```
+Creators see analytics on their stories:
+  - Total views, unique viewers
+  - Forward taps (skipped ahead), backward taps (rewatched)
+  - Exits (swiped away during this story)
+  - Reply count
+
+Data collection:
+  Client sends events via Kafka:
+    {story_id, viewer_id, event: "view"|"forward_tap"|"back_tap"|"exit"|"reply"}
+  
+  Flink aggregation:
+    Per story: COUNT(views), COUNT(DISTINCT viewer_id), 
+              COUNT(forward_taps), COUNT(exits)
+  
+  Storage: Redis hash per story (TTL: 24h, same as story)
+    HSET story_analytics:{story_id} views 1523 unique 1200 
+         forward_taps 342 exits 89 replies 12
+
+  Display on creator's story viewer list:
+    "1,200 people viewed • 12 replies • 89 exits"
+    
+  Insight: High exit rate on a story → content was boring/irrelevant
+  Insight: High back_tap rate → content was interesting enough to rewatch
+```
+
+### Story Replies — Bridging Stories and DMs
+
+```
+User viewing a story → types a reply → sends as a DM to the story author
+
+Implementation:
+  Reply is a regular DM message with metadata:
+    { type: "story_reply", story_id: "s-uuid", text: "Love this view!",
+      story_thumbnail_url: "https://cdn.../thumb.jpg" }
+  
+  The DM thread shows the story thumbnail + reply text
+  After 24h when story expires: thumbnail still visible in DM (cached copy)
+  
+  Why not delete the reply when story expires?
+    The reply is a DM — it's a conversation, not ephemeral
+    Only the STORY is ephemeral, not the conversation about it
+    
+  Rate limiting: Max 20 story replies/hour (prevent spam replies to celebrities)
+```
+
