@@ -1,4 +1,4 @@
-# HLD Prep — 100 System Design Problems
+# HLD Prep — 102 System Design Problems
 
 > **For senior / staff engineers** who already know the fundamentals but need to sharpen depth, nail tricky trade-offs, and plug gaps that cost rounds.
 
@@ -7,7 +7,7 @@ The 100 problems are split into **three progressive batches**:
 | Batch | Problems | Goal |
 |-------|----------|------|
 | **🔴 Batch 1 — Must Do** | 30 | High ROI. Covers the widest spread of categories, each one chosen because it teaches a **non-obvious depth concept** that senior/staff interviews specifically probe. Completing just this batch gives you strong coverage across all major domains. |
-| **🟡 Batch 2 — Expand** | 30 | Broadens your arsenal. Fills remaining categories, introduces niche domains (fintech, ad-tech, ML systems), and adds problems where the **differentiator is a specific technique** (CRDT, circuit breaker, consensus). |
+| **🟡 Batch 2 — Expand** | 32 | Broadens your arsenal. Fills remaining categories, introduces niche domains (fintech, ad-tech, ML systems, CDC, workflow orchestration), and adds problems where the **differentiator is a specific technique** (CRDT, circuit breaker, consensus, durable execution). |
 | **🟢 Batch 3 — Good to Have** | 40 | Lower marginal ROI. Either simpler problems you can reason through in an interview without deep prep, or very specialized systems. Study if time permits — these won't be your weak link. |
 
 Within each batch, problems are ordered so that **earlier ones build foundations that later ones reference**.
@@ -91,8 +91,10 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 | 28 | [Ad Click Prediction](Top%2080%20Questions/97_Ad_Click_Prediction.md) | ML Systems | ⭐⭐⭐⭐ Hard | Feature engineering at serving time, model serving latency, click-through rate prediction, bid optimization, feedback loop, online learning |
 | 29 | [Realtime Bidding System (Ad Tech)](Top%2080%20Questions/89_Realtime_Bidding_System.md) | Ad Tech | ⭐⭐⭐⭐ Hard | 100ms bid deadline, bid request/response protocol (OpenRTB), budget pacing, frequency capping, auction types (first-price vs second-price) |
 | 30 | [P2P File Transfer (BitTorrent)](Top%2080%20Questions/91_P2P_File_Transfer_BitTorrent.md) | Distributed | ⭐⭐⭐⭐ Hard | Piece selection (rarest first), peer discovery (DHT/tracker), tit-for-tat incentive, NAT traversal (STUN/TURN), swarm management |
+| 31 | [CDC Pipeline (Debezium)](Top%2080%20Questions/101_CDC_Pipeline.md) | Data Infra | ⭐⭐⭐⭐ Hard | Log-based CDC (WAL/binlog), replication slots, outbox pattern, schema evolution, initial snapshot + streaming, exactly-once via idempotent sinks — **the pattern that enables microservice decomposition and CQRS** |
+| 32 | [Workflow Orchestration (Temporal)](Top%2080%20Questions/102_Workflow_Orchestration_Temporal.md) | Infrastructure | ⭐⭐⭐⭐⭐ Very Hard | Durable execution via event-sourced replay, saga pattern with compensation, activity idempotency, workflow versioning, long-running timers, orchestration vs choreography — **the answer to "how do you coordinate multi-step distributed transactions?"** |
 
-**After Batch 2 you'll have added:** multi-sided marketplaces, flash sales, stream processing, advanced geo/navigation, blob storage, TSDB, video conferencing, resilience patterns, A/B testing, auth, fintech ledgers, ad tech, P2P, game backends.
+**After Batch 2 you'll have added:** multi-sided marketplaces, flash sales, stream processing, advanced geo/navigation, blob storage, TSDB, video conferencing, resilience patterns, A/B testing, auth, fintech ledgers, ad tech, P2P, game backends, CDC pipelines, workflow orchestration.
 
 ---
 
@@ -147,7 +149,7 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 
 ## 📊 Coverage Summary
 
-| Dimension | Batch 1 (30) | + Batch 2 (60) | + Batch 3 (100) |
+| Dimension | Batch 1 (30) | + Batch 2 (62) | + Batch 3 (102) |
 |-----------|:------------:|:--------------:|:---------------:|
 | Core Infra (cache, queue, LB, locks) | ✅ | ✅ | ✅ |
 | Feed & Social | ✅ | ✅✅ | ✅✅✅ |
@@ -165,6 +167,8 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 | Collaboration / Productivity | ✅ | ✅ | ✅✅ |
 | Ad Tech | — | ✅✅ | ✅✅ |
 | DevOps / Platform | — | ✅ | ✅✅ |
+| Data Infra (CDC, Pipelines) | — | ✅✅ | ✅✅ |
+| Workflow / Orchestration | — | ✅ | ✅ |
 
 ---
 
@@ -187,7 +191,7 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 | Complexity | Count | Distribution |
 |------------|-------|-------------|
 | ⭐⭐ Easy | 1 | 1% |
-| ⭐⭐⭐ Medium | 36 | 36% |
-| ⭐⭐⭐⭐ Hard | 48 | 48% |
-| ⭐⭐⭐⭐⭐ Very Hard | 15 | 15% |
-| **Total** | **100** | |
+| ⭐⭐⭐ Medium | 36 | 35% |
+| ⭐⭐⭐⭐ Hard | 49 | 48% |
+| ⭐⭐⭐⭐⭐ Very Hard | 16 | 16% |
+| **Total** | **102** | |
