@@ -50,35 +50,83 @@
 ```
 ┌──────────────┐
 │    Client    │
+│ (Web/Mobile) │
 └──────┬───────┘
        │
 ┌──────▼───────┐
-│    CDN       │  ← Product images, static assets
+│    CDN       │  ← Product images, static assets, cached pages
 └──────┬───────┘
        │
 ┌──────▼───────┐
 │ API Gateway  │  ← Auth, rate limiting, routing
 └──────┬───────┘
        │
-       ├────────┬────────┬────────┬────────┬────────┐
-       │        │        │        │        │        │
-┌──────▼──┐┌───▼───┐┌───▼───┐┌───▼───┐┌───▼───┐┌───▼───┐
-│Product  ││Search ││ Cart  ││ Order ││Payment││Inventory│
-│Catalog  ││Service││Service││Service││Service││Service │
-│Service  ││       ││       ││       ││       ││        │
-└────┬────┘└───┬───┘└───┬───┘└───┬───┘└───┬───┘└───┬────┘
-     │         │        │        │        │        │
-┌────▼────┐┌───▼───┐┌───▼──┐┌───▼───┐┌───▼───┐┌───▼────┐
-│MongoDB/ ││Elastic││Redis ││Postgres││Payment││Postgres│
-│DynamoDB ││Search ││      ││(Orders)││Gateway││(Stock) │
-│(Catalog)││       ││      ││       ││(Stripe)││       │
-└─────────┘└───────┘└──────┘└───────┘└───────┘└────────┘
+       ├───────────┬───────────┬───────────┬───────────┬──────────┐
+       │           │           │           │           │          │
+┌──────▼──┐ ┌─────▼────┐ ┌────▼────┐ ┌────▼───┐ ┌────▼───┐ ┌───▼──────┐
+│Product  │ │ Search   │ │ Cart   │ │ User   │ │Recommend│ │Notif     │
+│Catalog  │ │ Service  │ │ Service│ │Service │ │ation   │ │Service   │
+│Service  │ │          │ │        │ │        │ │Service │ │(email,   │
+│         │ │          │ │        │ │        │ │(collab │ │ push,    │
+│         │ │          │ │        │ │        │ │filter, │ │ SMS)     │
+│         │ │          │ │        │ │        │ │content)│ │          │
+└────┬────┘ └────┬─────┘ └───┬────┘ └────┬───┘ └───┬────┘ └──────────┘
+     │           │           │           │         │
+┌────▼────┐ ┌────▼────┐ ┌───▼───┐  ┌────▼────┐ ┌──▼──────┐
+│MongoDB/ │ │Elastic  │ │ Redis │  │PostgreSQL│ │ ML      │
+│DynamoDB │ │Search   │ │(cart  │  │(Users,   │ │Pipeline │
+│(Catalog)│ │(full-   │ │ data, │  │ Addresses│ │(Spark)  │
+│         │ │text +   │ │ TTL   │  │ Prefs)   │ │         │
+│         │ │facets)  │ │ 30d)  │  └──────────┘ └─────────┘
+└─────────┘ └─────────┘ └───────┘
 
-Async Processing:
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│  Kafka   │────▶│  Order   │────▶│Notif +   │
-│(Events)  │     │ Workers  │     │Analytics │
-└──────────┘     └──────────┘     └──────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│              CHECKOUT / ORDER FLOW (Saga Orchestrator)             │
+│                                                                    │
+│  Client places order → Order Service (orchestrator)                │
+│                              │                                     │
+│     Step 1                   │              Step 2                  │
+│  ┌──────────────────┐        │        ┌──────────────────┐         │
+│  │ Inventory Service│◄───────┼───────▶│ Payment Service  │         │
+│  │ (reserve stock:  │        │        │ (authorize charge│         │
+│  │  SELECT...FOR    │        │        │  via PSP:        │         │
+│  │  UPDATE, atomic  │        │        │  Stripe/Adyen)   │         │
+│  │  decrement)      │        │        │                  │         │
+│  │  Compensate:     │        │        │  Compensate:     │         │
+│  │   release stock  │        │        │   void auth      │         │
+│  └────────┬─────────┘        │        └────────┬─────────┘         │
+│           │                  │                 │                    │
+│           │            ┌─────▼─────┐           │                   │
+│           │            │ Order     │           │                   │
+│           └───────────▶│ Service   │◄──────────┘                   │
+│                        │ (PostgreSQL│                               │
+│                        │  orders,   │     Step 3                    │
+│                        │  state     │  ┌──────────────────┐        │
+│                        │  machine)  │─▶│ Notification     │        │
+│                        └─────┬──────┘  │ (order confirm,  │        │
+│                              │         │  shipping update) │        │
+│                              ▼         └──────────────────┘        │
+│                        ┌────────────┐                              │
+│                        │ Inventory  │                              │
+│                        │ (confirm:  │                              │
+│                        │  reserved→ │                              │
+│                        │  committed)│                              │
+│                        └────────────┘                              │
+└────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│                  ASYNC EVENT PIPELINE                               │
+│                                                                    │
+│  ┌──────────┐     ┌──────────────┐     ┌──────────────┐           │
+│  │  Kafka   │────▶│ Consumers:   │────▶│ Downstream:  │           │
+│  │(order-   │     │ • ES indexer │     │ • ClickHouse │           │
+│  │ events,  │     │ • Analytics  │     │   (analytics)│           │
+│  │ product- │     │ • Recommend  │     │ • Data Lake  │           │
+│  │ events,  │     │   pipeline   │     │   (S3)       │           │
+│  │ inventory│     │ • Fraud check│     │              │           │
+│  │ -events) │     │ • Notify     │     │              │           │
+│  └──────────┘     └──────────────┘     └──────────────┘           │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
@@ -144,6 +192,46 @@ If step 5 fails → Compensate: Refund Payment + Release Inventory
 - **Idempotency**: Every payment attempt has a unique `idempotency_key` → retry-safe
 - **Two-phase**: Authorize on order placement → Capture on shipment confirmation
 - **Refunds**: Automated for cancellations; manual review for disputes
+
+#### User Service
+- Manages user accounts, addresses, preferences, payment methods
+- **PostgreSQL** (relational data with ACID — address linked to user, payment methods linked to user)
+- **APIs**: Register, login, manage addresses (add/edit/delete), manage saved payment methods
+- On checkout: validate shipping address, select default payment method
+- **Guest checkout**: Creates a temporary user record; prompts to create full account after order
+
+#### Recommendation Service
+- Powers "Customers who bought this also bought...", "Frequently bought together", "Based on your browsing"
+- **Collaborative filtering** (batch Spark job): Mine co-purchase patterns from order history → store item-to-item associations
+- **Content-based**: Similar products by attributes (brand, category, price range, product embedding similarity)
+- **Session-based**: Real-time recommendations from current session click/view history (lightweight model, served inline)
+- **Serving**: Pre-computed recommendations stored in Redis → served in < 50ms
+- **ML Pipeline (Spark)**: Runs daily, processes order data and clickstream → updates recommendation models → materializes top-50 recommendations per product and per user into Redis
+
+#### Notification Service
+- Sends transactional notifications triggered by order events (via Kafka consumer)
+- **Channels**: Email (SES/SendGrid), push notifications (FCM/APNs), SMS (Twilio)
+- **Events handled**:
+  - `order.placed` → order confirmation email + push
+  - `order.shipped` → shipping notification with tracking link
+  - `order.delivered` → delivery confirmation + review prompt
+  - `order.cancelled` → cancellation + refund confirmation
+  - `payment.failed` → retry prompt
+- **Template engine**: Per-channel templates with dynamic variables (order details, tracking URL, customer name)
+- **Preference management**: Users can opt in/out of marketing notifications; transactional notifications always sent
+
+#### Async Event Pipeline (Kafka)
+The backbone connecting all services asynchronously:
+
+- **Topics**: `order-events`, `product-events`, `inventory-events`, `user-events`, `click-events`
+- **Consumers**:
+  - **ES Indexer**: Product creates/updates → update Elasticsearch index (< 2 second lag)
+  - **Analytics Pipeline**: Order and click events → ClickHouse for business intelligence dashboards
+  - **Recommendation Pipeline**: Order completion events → trigger Spark job to update co-purchase associations
+  - **Fraud Detection**: Order events → ML model scores transaction risk → flag for review or auto-cancel
+  - **Notification Service**: Order state transitions → trigger appropriate notification channel
+  - **Data Lake (S3)**: All events archived for compliance, ML training, and historical analysis
+- **Why Kafka over direct service-to-service calls?** Decouples services — if Notification Service is down, orders still process; notifications are delivered when service recovers (Kafka retains events)
 
 ---
 

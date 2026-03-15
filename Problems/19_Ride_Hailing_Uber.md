@@ -43,48 +43,90 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐    ┌──────────────┐
-│  Rider App   │    │  Driver App  │
-└──────┬───────┘    └──────┬───────┘
-       │                    │
-       │ REST/WS           │ WS (location stream)
-       │                    │
-┌──────▼────────────────────▼───────┐
-│           API Gateway             │
-└──────┬────────────────────┬───────┘
-       │                    │
-       │              ┌─────▼──────────┐
-       │              │ Location       │
-       │              │ Service        │  ← Ingests 500K loc updates/sec
-       │              └─────┬──────────┘
-       │                    │
-       │              ┌─────▼──────────┐
-       │              │ Location       │
-       │              │ Index          │  ← Geospatial index (in-memory)
-       │              │ (QuadTree /    │
-       │              │  GeoHash)      │
-       │              └────────────────┘
-       │
-┌──────▼───────┐    ┌──────────────┐    ┌──────────────┐
-│  Ride        │    │  Matching    │    │  Pricing     │
-│  Service     │◄──▶│  Service     │◄──▶│  Service     │
-│ (Trip CRUD)  │    │ (Driver      │    │ (Surge,      │
-│              │    │  Selection)  │    │  ETA, Fare)  │
-└──────┬───────┘    └──────────────┘    └──────────────┘
-       │
-┌──────▼───────┐    ┌──────────────┐    ┌──────────────┐
-│  Payment     │    │  Notification│    │  Map / Route │
-│  Service     │    │  Service     │    │  Service     │
-└──────────────┘    └──────────────┘    │  (OSRM/Google│
-                                        │   Maps API)  │
-                                        └──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         CLIENTS                                        │
+│                                                                        │
+│  ┌─────────────────────┐              ┌─────────────────────┐          │
+│  │  Rider App           │              │  Driver App          │          │
+│  │  • Request ride      │              │  • GPS stream (4s)  │          │
+│  │  • Track driver      │              │  • Accept/decline   │          │
+│  │  • Rate + pay        │              │  • Navigation       │          │
+│  └──────────┬───────────┘              └──────────┬──────────┘          │
+│             │ REST + WebSocket                    │ WebSocket (loc)     │
+└─────────────│─────────────────────────────────────│─────────────────────┘
+              │                                     │
+┌─────────────▼─────────────────────────────────────▼─────────────────────┐
+│                         API Gateway                                      │
+│  Auth (JWT), rate limiting, geo-routing to nearest DC                   │
+└─────────────┬──────────────┬──────────────────────┬─────────────────────┘
+              │              │                      │
+┌─────────────▼────┐  ┌──────▼──────────┐   ┌──────▼──────────────────┐
+│  Ride Service    │  │ Location        │   │ Matching Service       │
+│  (Trip State     │  │ Service         │   │                        │
+│   Machine)       │  │                 │   │ 1. Query geo-index for │
+│                  │  │ • Ingest 500K   │   │    nearby drivers      │
+│  States:         │  │   GPS updates/s │   │ 2. Filter: available,  │
+│  requested →     │  │ • Update in-mem │   │    correct vehicle type│
+│  matched →       │  │   geospatial    │   │ 3. Rank by ETA +       │
+│  driver_en_route→│  │   index         │   │    rating + acceptance │
+│  arrived →       │  │ • Publish to    │   │ 4. Send request to top │
+│  in_progress →   │  │   Kafka for     │   │    driver (15s timeout)│
+│  completed →     │  │   tracking +    │   │ 5. Decline → next      │
+│  payment_done    │  │   analytics     │   │    candidate           │
+│                  │  │                 │   │ 6. Accept → create trip│
+│  Compensation:   │  └────────┬────────┘   │                        │
+│  cancel → refund │           │            │ Distributed lock:      │
+│  dispute → review│  ┌────────▼────────┐   │ SET driver:lock:{id}   │
+│                  │  │ Geospatial      │   │ NX EX 30               │
+│                  │  │ Index           │   │ (prevent double-match) │
+└────────┬─────────┘  │                 │   └────────────────────────┘
+         │            │ In-Memory:      │
+         │            │ QuadTree / H3   │          ┌──────────────────┐
+         │            │ (2M drivers ×   │          │ Pricing Service  │
+         │            │  64B = 128 MB)  │          │                  │
+         │            │                 │          │ • Surge: demand/ │
+         │            │ Per-city shard  │          │   supply per H3  │
+         │            │                 │          │   cell (every 30s│
+         │            └─────────────────┘          │ • ETA: OSRM /   │
+         │                                         │   Google Maps    │
+         │                                         │ • Fare: base +  │
+         │                                         │   time + dist   │
+         │                                         │   × surge       │
+         │                                         └──────────────────┘
+         │
+         ├───────────────────────┬───────────────────────┐
+         │                      │                       │
+┌────────▼──────┐  ┌────────────▼──────┐  ┌─────────────▼──────┐
+│ Payment       │  │ Notification      │  │ Map / Route        │
+│ Service       │  │ Service           │  │ Service            │
+│               │  │                   │  │                    │
+│ • Charge rider│  │ • Push: "Driver   │  │ • OSRM / Google    │
+│   at trip end │  │   arriving in 3m" │  │   Maps Directions  │
+│ • Pay driver  │  │ • SMS: trip receipt│  │ • ETA computation  │
+│   weekly      │  │ • Rider ↔ Driver  │  │ • Live traffic     │
+│ • Stripe/PSP  │  │   match notifs    │  │   from driver GPS  │
+│ • Refunds     │  │ • APNs + FCM      │  │   data aggregation │
+│ • Split fare  │  │                   │  │                    │
+└───────────────┘  └───────────────────┘  └────────────────────┘
 
-Data Stores:
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  PostgreSQL  │  │    Redis     │  │   Kafka      │
-│ (Trips, Users│  │ (Driver Loc, │  │ (Events,     │
-│  Payments)   │  │  Sessions)   │  │  Location)   │
-└──────────────┘  └──────────────┘  └──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         DATA LAYER                                     │
+│                                                                        │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐               │
+│  │ PostgreSQL   │   │    Redis     │   │   Kafka      │               │
+│  │              │   │              │   │              │               │
+│  │ • trips      │   │ • Driver loc │   │ • driver-    │               │
+│  │ • users      │   │   (GeoSet)   │   │   location   │               │
+│  │ • payments   │   │ • Session    │   │ • trip-events│               │
+│  │ • driver     │   │ • Surge      │   │ • payment-   │               │
+│  │   profiles   │   │   cache per  │   │   events     │               │
+│  │ • vehicles   │   │   H3 cell    │   │ • push-notif │               │
+│  │ • regions    │   │ • Driver     │   │              │               │
+│  │              │   │   lock       │   │ → Analytics  │               │
+│  │              │   │   (match     │   │ → Fraud      │               │
+│  │              │   │   guard)     │   │ → ETA model  │               │
+│  └──────────────┘   └──────────────┘   └──────────────┘               │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
@@ -194,6 +236,47 @@ fare = max(fare, minimum_fare)
 - **Pre-computation**: For each driver candidate, compute ETA to rider (road distance, not straight line)
 - **Real-time traffic**: Aggregate driver speed data across road segments → build live traffic model
 - ETA for trip: route from pickup to dropoff considering current traffic
+
+#### Ride Service — Trip State Machine
+Manages the full lifecycle of a ride as a state machine:
+
+```
+REQUESTED → MATCHED → DRIVER_EN_ROUTE → ARRIVED → IN_TRIP → COMPLETED → PAYMENT_DONE
+     │          │           │              │          │          │
+     └─CANCEL───└───CANCEL──└───CANCEL─────└──CANCEL──│          │
+         ↓          ↓           ↓              ↓      │          │
+     refund_100% refund_100% refund_100%  cancel_fee  │     ┌────▼────┐
+                                          ($5)        │     │ DISPUTE │
+                                                      │     └─────────┘
+                                                  NO_CANCEL
+                                                  (safety only)
+```
+
+- **Atomicity**: Each state transition is a PostgreSQL transaction (UPDATE with WHERE status = expected_state — optimistic locking)
+- **Event publishing**: On each transition → publish to Kafka `trip-events` topic → consumed by Notification Service, Analytics, Fraud Detection
+- **Timeout guards**: If driver doesn't arrive within 10 minutes of ETA → auto-cancel, no penalty to rider, penalize driver
+- **Compensation**: On cancel → refund if applicable → release driver lock → re-queue driver as available
+
+#### Payment Service
+- **When**: Triggered on trip completion (status = COMPLETED)
+- **Charge flow**:
+  1. Calculate final fare (actual distance × per-mile + actual time × per-min + surge + tolls + booking fee)
+  2. Charge rider's card via PSP (Stripe/Braintree) with `idempotency_key = trip_id`
+  3. On success → update trip status to PAYMENT_DONE
+  4. On failure → retry 3× → if persistent, charge via backup payment method → if still fails, mark for manual collection
+- **Driver payout**: Batched weekly. Aggregate completed trips → calculate driver earnings (fare - platform commission ~25%) → ACH/bank transfer
+- **Split fare**: Multiple riders on the same trip → split total ÷ N riders, charge each
+- **Promotions / credits**: Deduct from rider balance before charging card
+
+#### Notification Service
+- Consumes events from Kafka `trip-events` and triggers push notifications:
+  - `MATCHED` → Rider: "Driver {name} is on the way" (with vehicle details, photo)
+  - `MATCHED` → Driver: "Ride request from {pickup_address}"
+  - `ARRIVED` → Rider: "Your driver has arrived"
+  - `COMPLETED` → Rider: trip receipt (fare breakdown, route map, rating prompt)
+  - `CANCELLED` → Both parties: cancellation confirmation
+- **Channels**: APNs (iOS), FCM (Android), SMS (fallback for critical notifications like receipts)
+- **Real-time tracking**: During DRIVER_EN_ROUTE and IN_TRIP, driver location updates are pushed to rider's app via WebSocket (not push notification — continuous stream)
 
 ---
 

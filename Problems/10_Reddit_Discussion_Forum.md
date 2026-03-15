@@ -49,46 +49,101 @@
 ```
 ┌──────────────┐
 │    Client    │
+│ (Web/Mobile) │
 └──────┬───────┘
        │
 ┌──────▼───────┐
-│ API Gateway  │
+│ API Gateway  │  ← Auth, rate limiting, bot detection
 └──────┬───────┘
        │
-       ├───────────┬───────────┬───────────┬──────────┐
-       │           │           │           │          │
-┌──────▼──┐ ┌─────▼────┐ ┌────▼────┐ ┌────▼───┐ ┌───▼────┐
-│ Post    │ │ Comment  │ │  Vote   │ │ Feed   │ │Search  │
-│ Service │ │ Service  │ │ Service │ │ Service│ │Service │
-└────┬────┘ └────┬─────┘ └────┬────┘ └────┬───┘ └───┬────┘
+       ├───────────┬───────────┬───────────┬──────────┬──────────┐
+       │           │           │           │          │          │
+┌──────▼──┐ ┌─────▼────┐ ┌────▼────┐ ┌────▼───┐ ┌───▼────┐ ┌──▼───────┐
+│ Post    │ │ Comment  │ │  Vote   │ │ Feed   │ │Search  │ │Subreddit │
+│ Service │ │ Service  │ │ Service │ │ Service│ │Service │ │ Service  │
+│         │ │          │ │         │ │        │ │        │ │          │
+│ • CRUD  │ │ • Nested │ │ • Dedup │ │ • Home │ │ • Full │ │ • Create │
+│ • Media │ │   tree   │ │   check │ │   feed │ │   text │ │ • Join / │
+│   upload│ │   (mat.  │ │   Redis │ │   merge│ │   posts│ │   leave  │
+│ → S3    │ │   path)  │ │ • Kafka │ │   from │ │ • Sub  │ │ • Rules  │
+│ • Flair │ │ • Sort:  │ │   buffer│ │   subs │ │   name │ │ • Mods   │
+│ • Publish│ │  best,   │ │ • Async │ │ • Rank │ │   search│ │ • Ban   │
+│   event │ │  top,    │ │   DB    │ │   by   │ │        │ │   users  │
+│         │ │  new,    │ │   write │ │   hot / │ │        │ │          │
+│         │ │  controv.│ │         │ │   top   │ │        │ │          │
+└────┬────┘ └────┬─────┘ └────┬────┘ └────┬───┘ └───┬────┘ └──────────┘
      │           │            │            │         │
-     │      ┌────▼─────┐  ┌──▼──────┐     │    ┌────▼────┐
-     │      │ Comment  │  │  Redis  │     │    │Elastic  │
-     │      │ Tree     │  │ (Vote   │     │    │Search   │
-     │      │ Service  │  │  Count  │     │    └─────────┘
-     │      └──────────┘  │  Cache) │     │
-     │                    └─────────┘     │
-     │                                    │
-┌────▼────────────────────────────────────▼────┐
-│                   Kafka                      │
-│  (post-events, vote-events, comment-events)  │
-└────┬──────────────────────────────────┬──────┘
-     │                                  │
-┌────▼────┐                      ┌──────▼──────┐
-│ Ranking │                      │  PostgreSQL │
-│ Worker  │                      │  (Posts,    │
-│         │                      │  Comments,  │
-│         │                      │  Votes)     │
-└────┬────┘                      └─────────────┘
+     │           │            │            │    ┌────▼────┐
+     │           │            │            │    │Elastic  │
+     │           │            │       ┌────▼──┐ │Search   │
+     │           │            │       │Redis  │ └─────────┘
+     │           │            │       │(Ranked│
+     │           │        ┌───▼────┐  │ Feeds │
+     │           │        │ Redis  │  │per sub│
+     │           │        │(Vote   │  │+ home)│
+     │           │        │ Counts │  └───────┘
+     │           │        │+ User  │
+     │           │        │ Vote   │
+     │           │        │ State) │
+     │           │        └────────┘
+     │           │            │
+┌────▼───────────▼────────────▼────────────────────────────┐
+│                        Kafka                              │
+│  (post-events, comment-events, vote-events)              │
+└────┬───────────────────────┬─────────────────────────────┘
+     │                       │
+┌────▼────┐           ┌──────▼──────┐
+│ Ranking │           │  Moderation │
+│ Worker  │           │  Pipeline   │
+│         │           │             │
+│ Consume │           │ • Spam ML   │
+│ vote +  │           │ • Toxicity  │
+│ post    │           │ • Report    │
+│ events  │           │   queue     │
+│ → re-   │           │ • Auto-     │
+│ compute │           │   remove    │
+│ hot/top │           └─────────────┘
+│ scores  │
+│ → update│
+│ Redis   │
+│ sorted  │
+│ sets    │
+└────┬────┘
      │
-┌────▼────┐
-│  Redis  │
-│ (Ranked │
-│  Feeds) │
-└─────────┘
+┌────▼────────────────────────────────────────────────────┐
+│                     DATA LAYER                           │
+│                                                           │
+│ ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│ │ PostgreSQL   │  │    Redis     │  │ Elasticsearch│    │
+│ │              │  │              │  │              │    │
+│ │ • posts      │  │ • vote counts│  │ • Post full  │    │
+│ │ • comments   │  │   per post/  │  │   text index │    │
+│ │   (mat. path)│  │   comment    │  │ • Subreddit  │    │
+│ │ • votes      │  │ • user vote  │  │   name index │    │
+│ │ • subreddits │  │   state per  │  │              │    │
+│ │ • users      │  │   post       │  │              │    │
+│ │ • memberships│  │ • ranked     │  │              │    │
+│ │              │  │   feeds (ZSET│  │              │    │
+│ │ Source of    │  │   per sub    │  │              │    │
+│ │ truth        │  │   by hot/top/│  │              │    │
+│ │              │  │   new)       │  │              │    │
+│ └──────────────┘  └──────────────┘  └──────────────┘    │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
+
+#### Post Service
+- **Create post**: Validate content (size limits, flair required for some subs), upload media to S3 if present, write to PostgreSQL, publish `post-created` event to Kafka
+- **Post types**: Text, link, image, video, poll — each stored with type-specific metadata
+- **Flair**: Per-subreddit flair system (tags like "Discussion", "Meme", "Question") — enforced by Post Service
+- **Soft delete**: Deleted posts keep the entry (for comment tree integrity) but content is replaced with "[deleted]"
+
+#### Subreddit Service
+- **Manages**: Subreddit creation, membership (join/leave), rules, moderator assignments, banned users
+- **Membership**: `user_subreddits` table (user_id, subreddit_id) — used by Feed Service to build home feed
+- **Access control**: Public, restricted (anyone can view, only approved can post), private (invite-only)
+- **Moderator actions**: Remove posts/comments, ban users, pin posts, configure automod rules
 
 #### Comment Tree Service — The Key Challenge
 Reddit's nested comment tree is the most complex data model:
@@ -185,6 +240,19 @@ def controversial_score(ups, downs):
 - **Pre-computation**: Background job periodically computes top posts per subreddit → stores in Redis
 - **On request**: Merge top posts from subscribed subreddits, interleave by score
 - **Popular/All**: Global feed → single pre-computed ranked list in Redis
+
+#### Search Service (Elasticsearch)
+- **Indexed**: Post title, body text, subreddit name, author username
+- **Features**: Full-text search with BM25 ranking, filter by subreddit/time range/post type, sort by relevance or recency
+- **Sync**: Post creates/updates → Kafka → Elasticsearch consumer indexes in near real-time
+
+#### Moderation Pipeline
+- Consumes post and comment events from Kafka for automated moderation:
+  - **Spam ML model**: Detect spam posts (link farms, repetitive content, new account patterns)
+  - **Toxicity classifier**: Flag toxic/hateful content for review or auto-removal
+  - **AutoMod rules**: Per-subreddit regex rules (e.g., "remove posts with banned keywords", "require minimum karma to post")
+  - **Report queue**: User reports → prioritized queue for human moderators
+  - **Auto-removal**: Content matching high-confidence spam/toxicity → removed immediately, mod notified
 
 ---
 

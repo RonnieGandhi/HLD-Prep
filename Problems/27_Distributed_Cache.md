@@ -46,40 +46,94 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐
-│   Clients    │
-│ (App Servers)│
-└──────┬───────┘
-       │
-┌──────▼───────────────────────┐
-│   Cache Client Library       │  ← Consistent hashing, connection pooling
-│   (embedded in app)          │
-└──────┬───────────────────────┘
-       │ direct connection to responsible cache node
-       │
-       ├─────────────┬─────────────┬─────────────┐
-       │             │             │             │
-┌──────▼──────┐ ┌────▼────┐ ┌─────▼────┐ ┌─────▼────┐
-│ Cache Node 0│ │Cache    │ │Cache     │ │Cache     │
-│             │ │Node 1   │ │Node 2    │ │Node N    │
-│ ┌─────────┐ │ │         │ │          │ │          │
-│ │Hash Map │ │ │         │ │          │ │          │
-│ │(in-mem) │ │ │         │ │          │ │          │
-│ ├─────────┤ │ │         │ │          │ │          │
-│ │Eviction │ │ │         │ │          │ │          │
-│ │Policy   │ │ │         │ │          │ │          │
-│ │(LRU/LFU)│ │ │         │ │          │ │          │
-│ └─────────┘ │ │         │ │          │ │          │
-└─────────────┘ └─────────┘ └──────────┘ └──────────┘
-
-Optional: Replication
-┌─────────────┐
-│ Cache Node 0│──replica──▶│Cache Node 0'│
-│  (Primary)  │            │  (Replica)  │
-└─────────────┘            └─────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Application Servers                                │
+│                                                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │  L1: In-Process Cache (Caffeine / Guava)                         │ │
+│  │  ~100 MB per server, < 0.1 ms, hottest keys only                 │ │
+│  │  TTL: 30s (short, to limit staleness)                            │ │
+│  └────────────────────────────┬──────────────────────────────────────┘ │
+│                               │ L1 miss                               │
+│  ┌────────────────────────────▼──────────────────────────────────────┐ │
+│  │  Cache Client Library (embedded in each app server)              │ │
+│  │  • Consistent hashing: CRC16(key) % 16384 → hash slot → node    │ │
+│  │  • Connection pooling: persistent TCP to each cache node         │ │
+│  │  • Retry + circuit breaker per node                              │ │
+│  │  • Compression for values > 1 KB                                 │ │
+│  └────────────────────────────┬──────────────────────────────────────┘ │
+└───────────────────────────────┼────────────────────────────────────────┘
+                                │ direct connection to responsible node
+                                │
+┌───────────────────────────────▼────────────────────────────────────────┐
+│            L2: Distributed Cache Cluster (Redis Cluster)              │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  16,384 Hash Slots distributed across masters                   │  │
+│  │                                                                  │  │
+│  │  slot = CRC16(key) % 16384                                      │  │
+│  │                                                                  │  │
+│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐     │  │
+│  │  │  Master A      │  │  Master B      │  │  Master C      │     │  │
+│  │  │  Slots 0-5460  │  │  Slots 5461-   │  │  Slots 10923-  │     │  │
+│  │  │                │  │  10922          │  │  16383         │     │  │
+│  │  │ ┌────────────┐ │  │ ┌────────────┐ │  │ ┌────────────┐ │     │  │
+│  │  │ │ Hash Map   │ │  │ │ Hash Map   │ │  │ │ Hash Map   │ │     │  │
+│  │  │ │ (in-memory)│ │  │ │            │ │  │ │            │ │     │  │
+│  │  │ ├────────────┤ │  │ ├────────────┤ │  │ ├────────────┤ │     │  │
+│  │  │ │ Eviction   │ │  │ │ Eviction   │ │  │ │ Eviction   │ │     │  │
+│  │  │ │ (LRU/LFU)  │ │  │ │ (LRU/LFU)  │ │  │ │ (LRU/LFU)  │ │     │  │
+│  │  │ └────────────┘ │  │ └────────────┘ │  │ └────────────┘ │     │  │
+│  │  │       │        │  │       │        │  │       │        │     │  │
+│  │  │  async repl.   │  │  async repl.   │  │  async repl.   │     │  │
+│  │  │       │        │  │       │        │  │       │        │     │  │
+│  │  │ ┌─────▼──────┐ │  │ ┌─────▼──────┐ │  │ ┌─────▼──────┐ │     │  │
+│  │  │ │ Replica A' │ │  │ │ Replica B' │ │  │ │ Replica C' │ │     │  │
+│  │  │ │ (failover) │ │  │ │ (failover) │ │  │ │ (failover) │ │     │  │
+│  │  │ └────────────┘ │  │ └────────────┘ │  │ └────────────┘ │     │  │
+│  │  └────────────────┘  └────────────────┘  └────────────────┘     │  │
+│  │                                                                  │  │
+│  │  MOVED redirect: if client hits wrong node, node responds with  │  │
+│  │  MOVED {slot} {correct_host}:{port} → client updates slot map   │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  On cache miss → App reads from Primary DB → writes back to cache     │
+└────────────────────────────────────────────────────────────────────────┘
+                                │
+                         ┌──────▼──────┐
+                         │ Primary DB  │  ← Source of truth
+                         │ (PostgreSQL │     Cache is a read-through
+                         │  / MySQL)   │     acceleration layer
+                         └─────────────┘
 ```
 
 ### Component Deep Dive
+
+#### L1: In-Process Cache (Caffeine / Guava)
+- Local cache within each application server's JVM — no network hop, < 0.1ms latency
+- **Size**: ~100 MB per server (limited by JVM heap — don't starve the application)
+- **TTL**: Short (30 seconds) to limit staleness — L1 has no cache invalidation from Redis
+- **Eviction**: Window TinyLFU (Caffeine) — near-optimal hit rates, better than LRU for skewed workloads
+- **Use case**: Hottest keys only — configuration data, user session, frequently accessed product data
+- **Trade-off**: Each app server has its own L1 → after an update, different servers may return different values for up to 30 seconds (TTL). Acceptable for most read-heavy workloads; NOT suitable for data requiring strong consistency
+
+```
+Request flow:
+  1. Check L1 (in-process) → hit? Return immediately (< 0.1ms)
+  2. L1 miss → Check L2 (Redis) → hit? Return + populate L1 (< 1ms)
+  3. L2 miss → Read from Primary DB → populate L2 + L1 (5-50ms)
+```
+
+#### Cache Client Library
+Embedded in each application server — handles routing, connections, and resilience:
+
+- **Hash slot routing**: Compute `CRC16(key) % 16384` → look up slot-to-node mapping → send directly to the responsible master node. No proxy overhead.
+- **Slot map cache**: Client stores the full slot→node mapping locally. Refreshed on MOVED redirects or periodically (every 60 seconds).
+- **Connection pooling**: Persistent TCP connections to each cache node (pool of 10-20 connections per node). Avoids TCP handshake overhead per request.
+- **Pipelining**: Batch multiple commands into a single network round-trip (e.g., fetch 50 keys in one pipeline call → 50× less latency than sequential GETs)
+- **Compression**: For values > 1 KB, compress with LZ4 before storing (reduces memory usage and network bandwidth). Transparent to the caller.
+- **Circuit breaker**: Per-node circuit breaker — if a node fails 5 consecutive health checks, stop sending requests to it for 30 seconds (fallback to DB or return stale L1 data). Prevents cascading failures when a cache node is slow/down.
+- **Retry with timeout**: 2ms timeout per request + 1 retry on failure. Don't let a slow cache node block the application thread (cache miss to DB is better than hanging).
 
 #### Consistent Hashing — Data Distribution
 

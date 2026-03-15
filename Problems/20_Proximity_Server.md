@@ -42,29 +42,72 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐
-│    Client    │
-└──────┬───────┘
-       │
-┌──────▼───────┐
-│ API Gateway  │
-│ (+ LBS)     │  ← Location-Based Service routing
-└──────┬───────┘
-       │
-       ├────────────────────────────┐
-       │                            │
-┌──────▼───────┐            ┌──────▼───────┐
-│  Proximity   │            │  Business    │
-│  Search Svc  │            │  Service     │
-│              │            │  (CRUD)      │
-└──────┬───────┘            └──────┬───────┘
-       │                           │
-┌──────▼───────┐            ┌──────▼───────┐
-│ Geospatial   │            │  MySQL       │
-│ Index        │            │ (Business    │
-│ (QuadTree /  │            │  Metadata)   │
-│  GeoHash)    │            └──────────────┘
-└──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           Clients                                     │
+│                                                                       │
+│  ┌─────────────────┐              ┌─────────────────┐                │
+│  │ Search Nearby   │              │ Nearby Friends  │                │
+│  │ Businesses      │              │ (Real-Time)     │                │
+│  │ (REST)          │              │ (WebSocket)     │                │
+│  └────────┬────────┘              └────────┬────────┘                │
+└───────────┼────────────────────────────────┼─────────────────────────┘
+            │                                │
+┌───────────▼────────────────────────────────▼─────────────────────────┐
+│                         API Gateway                                   │
+│  Auth, rate limiting, geo-routing                                     │
+└───────────┬────────────────────────────────┬─────────────────────────┘
+            │                                │
+┌───────────▼──────────┐          ┌──────────▼───────────────┐
+│  Proximity Search    │          │  Nearby Friends          │
+│  Service             │          │  Service (Real-Time)     │
+│                      │          │                          │
+│  1. Parse lat/lng    │          │  • WebSocket per user    │
+│  2. Compute GeoHash  │          │  • Receive location      │
+│  3. Query QuadTree   │          │    updates every 4s      │
+│     or Redis Geo     │          │  • Query friends' locs   │
+│  4. Filter by radius │          │  • Push nearby list      │
+│  5. Enrich from cache│          │                          │
+└───────┬──────┬───────┘          └──────┬─────┬─────────────┘
+        │      │                         │     │
+        │      │                    ┌────▼─────▼────┐
+        │      │                    │  Redis Geo    │
+        │      │                    │  (User Locs)  │
+        │      │                    │               │
+        │      │                    │  GEOADD       │
+        │      │                    │  user_locations│
+        │      │                    │  {lng} {lat}  │
+        │      │                    │  {user_id}    │
+        │      │                    └───────────────┘
+        │      │
+┌───────▼──────┴───────┐
+│  Geospatial Index    │
+│                      │
+│  Option A: In-Memory │       ┌───────────────────┐
+│  QuadTree Servers    │       │  Redis            │
+│  (replicated, each   │       │  (Business Cache) │
+│   holds full tree:   │       │                   │
+│   200M biz × 32B     │       │  biz:{id} → Hash  │
+│   = 6.4 GB per node) │       │  { name, category,│
+│                      │       │    lat, lng,       │
+│  Option B: Redis     │       │    rating, ... }   │
+│  GeoIndex            │       │  TTL: 3600        │
+│  GEOADD businesses:  │       └───────────────────┘
+│  {category}          │
+│  {lng} {lat} {biz_id}│
+│  GEORADIUS 5km       │
+└──────────┬───────────┘
+           │
+┌──────────▼───────────┐
+│  MySQL               │
+│  (Business Listings) │
+│                      │
+│  Source of truth for  │
+│  all business data.  │
+│  QuadTree rebuilt     │
+│  from MySQL nightly.  │
+│  Incremental updates │
+│  via Kafka CDC.      │
+└──────────────────────┘
 ```
 
 ### Core Algorithm: Geospatial Indexing — Deep Dive
@@ -157,6 +200,18 @@ Root (World)
 - On create/update → update MySQL → async update geospatial index
 - Index rebuild is periodic (nightly) for full consistency
 - Hot businesses cached in Redis
+
+#### Kafka CDC — Incremental QuadTree Updates
+- Full QuadTree rebuild from MySQL runs nightly (~5 minutes for 200M businesses)
+- During the day, new/updated businesses can't wait until the nightly rebuild
+- **Debezium CDC** on MySQL captures row-level changes → publishes to Kafka topic `business-changes`
+- QuadTree server consumes the topic:
+  - **Insert**: Add business to the appropriate leaf node; if leaf exceeds K=100, split into 4 quadrants
+  - **Update** (location changed): Remove from old leaf, insert into new leaf
+  - **Update** (metadata only): Update in-place (no tree restructuring)
+  - **Delete/deactivate**: Remove from leaf node
+- Same CDC stream also updates Redis business cache (`biz:{id}`) and Redis GeoIndex (`GEOADD`)
+- Lag: business changes reflected in search within ~2 seconds
 
 ---
 

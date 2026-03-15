@@ -48,57 +48,108 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐
-│  Mobile /    │
-│  Web Client  │
-└──────┬───────┘
-       │
-┌──────▼───────────────────────────────────┐
-│              API Gateway / CDN           │
-│  (Map tiles served from CDN edge)        │
-└──────┬──────────────────┬────────────────┘
-       │                  │
-       │            ┌─────▼──────────┐
-       │            │  Tile Service  │ ← Serves pre-rendered / dynamic map tiles
-       │            │  (Vector/Raster│
-       │            │   Tile Server) │
-       │            └─────┬──────────┘
-       │                  │
-       │            ┌─────▼──────────┐
-       │            │  Tile Storage  │ ← S3 + CDN caching
-       │            │  (Pre-computed │
-       │            │   tile pyramid)│
-       │            └────────────────┘
-       │
-┌──────▼───────┐    ┌──────────────┐    ┌──────────────┐
-│  Routing     │    │  Geocoding   │    │  Search /    │
-│  Service     │    │  Service     │    │  POI Service │
-│  (OSRM/     │    │  (Address ↔  │    │  (Elastic-   │
-│  Valhalla)   │    │  Coordinates)│    │  search)     │
-└──────┬───────┘    └──────────────┘    └──────────────┘
-       │
-┌──────▼───────┐    ┌──────────────┐    ┌──────────────┐
-│  Navigation  │    │  Traffic     │    │  ETA         │
-│  Service     │    │  Service     │    │  Service     │
-│  (Turn-by-   │    │  (Real-time  │    │  (ML-based   │
-│   turn)      │    │   aggregation│    │   prediction)│
-└──────────────┘    └──────┬───────┘    └──────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │  Traffic     │
-                    │  Data Store  │
-                    │  (Time-series│
-                    │   per road   │
-                    │   segment)   │
-                    └──────────────┘
-
-Data Stores:
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  PostgreSQL  │  │    Redis     │  │   Kafka      │  │ Elasticsearch│
-│  + PostGIS   │  │ (Tile cache, │  │ (Location    │  │ (POI search) │
-│ (Road graph, │  │  traffic     │  │  telemetry,  │  │              │
-│  POIs, geo)  │  │  segments)   │  │  traffic)    │  │              │
-└──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                      CLIENT (Mobile / Web)                           │
+│                                                                       │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────┐  │
+│  │ Map Renderer   │  │ Navigation    │  │ Search Bar             │  │
+│  │ (WebGL/OpenGL) │  │ (Turn-by-turn)│  │ (autocomplete,         │  │
+│  │                │  │               │  │  geocode)              │  │
+│  │ • Vector tile  │  │ • Route poly- │  │                        │  │
+│  │   rendering    │  │   line render │  │                        │  │
+│  │ • Style sheets │  │ • Voice prompts│ │                        │  │
+│  │ • Traffic      │  │ • Re-route on │  │                        │  │
+│  │   overlay      │  │   deviation   │  │                        │  │
+│  └───────┬────────┘  └───────┬────────┘  └────────┬───────────────┘  │
+└──────────│───────────────────│─────────────────────│─────────────────┘
+           │                   │                     │
+           │ tile requests     │ route requests      │ search/geocode
+           │ /{z}/{x}/{y}.mvt  │                     │
+           │                   │                     │
+┌──────────▼──────────┐        │                     │
+│   CDN (Edge Cache)  │        │                     │
+│                     │        │                     │
+│ Cache: vector tiles │        │                     │
+│ Hit rate: ~95%      │        │                     │
+│ (most tiles rarely  │        │                     │
+│  change)            │        │                     │
+└──────────┬──────────┘        │                     │
+           │ miss              │                     │
+           │                   │                     │
+┌──────────▼──────────────────▼─────────────────────▼──────────────────┐
+│                         API Gateway                                   │
+└──────────┬──────────────────┬─────────────────────┬──────────────────┘
+           │                  │                     │
+┌──────────▼────────┐ ┌──────▼───────┐    ┌────────▼────────┐
+│ Tile Service      │ │ Routing      │    │ Search / POI    │
+│                   │ │ Service      │    │ Service         │
+│ • Pre-rendered    │ │              │    │                 │
+│   tiles (z0-14)   │ │ • Contraction│    │ Elasticsearch:  │
+│   from S3         │ │   Hierarchies│    │ • POI name,     │
+│ • On-demand       │ │   (< 1ms     │    │   category,     │
+│   render (z15+)   │ │   continental│    │   address       │
+│   for sparse areas│ │   routes)    │    │ • Autocomplete  │
+│ • Traffic overlay │ │ • K-shortest │    │   prefix match  │
+│   tiles regen     │ │   paths      │    │                 │
+│   every 60s       │ │ • Real-time  │    ├─────────────────┤
+│                   │ │   traffic    │    │ Geocoding       │
+│ Vector tiles:     │ │   overlay on │    │ Service         │
+│ MVT (protobuf)    │ │   edge       │    │                 │
+│ 5-15 KB/tile      │ │   weights    │    │ • Address →     │
+│                   │ │              │    │   lat/lng       │
+└────────┬──────────┘ └──────┬───────┘    │ • lat/lng →     │
+         │                   │            │   address       │
+         │                   │            │   (reverse)     │
+         │            ┌──────▼───────┐    └─────────────────┘
+         │            │ Navigation   │
+         │            │ Service      │
+         │            │              │
+         │            │ • Turn-by-   │
+         │            │   turn       │
+         │            │   maneuvers  │
+         │            │ • Live re-   │
+         │            │   routing on │
+         │            │   deviation  │
+         │            │   or traffic │
+         │            │   change     │
+         │            └──────┬───────┘
+         │                   │
+         │            ┌──────▼───────────────────────────────────────┐
+         │            │  Traffic Service (Real-Time Pipeline)        │
+         │            │                                              │
+         │            │  Phone GPS (speed, lat, lng, heading)        │
+         │            │    → Kafka topic: traffic-telemetry          │
+         │            │    → Flink:                                  │
+         │            │      1. HMM map-match GPS → road segment    │
+         │            │      2. Aggregate speed per segment (60s)    │
+         │            │      3. Compare to free-flow → congestion    │
+         │            │    → Redis: traffic:{segment_id} → speed     │
+         │            │    → Trigger traffic tile regeneration        │
+         │            │                                              │
+         │            │  Also: incident reports, construction alerts │
+         │            └──────────────────────────────────────────────┘
+         │
+┌────────▼────────────────────────────────────────────────────────────┐
+│                         DATA LAYER                                   │
+│                                                                       │
+│ ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  ┌────────────┐ │
+│ │ PostgreSQL   │  │ S3 (Tile     │  │    Redis    │  │   Kafka    │ │
+│ │ + PostGIS    │  │  Storage)    │  │             │  │            │ │
+│ │              │  │              │  │ • Tile cache│  │ • traffic- │ │
+│ │ • Road graph │  │ • Pre-       │  │   (hot zoom │  │   telemetry│ │
+│ │   (2B nodes, │  │   rendered   │  │   levels)   │  │ • incident │ │
+│ │   5B edges)  │  │   vector     │  │ • Traffic   │  │   reports  │ │
+│ │ • POIs       │  │   tiles      │  │   per road  │  │ • route    │ │
+│ │ • Geospatial │  │ • Tile       │  │   segment   │  │   events   │ │
+│ │   indexes    │  │   pyramid    │  │ • Route     │  │            │ │
+│ │ • Road       │  │   (z0-z18)   │  │   cache     │  │            │ │
+│ │   attributes │  │              │  │   (popular  │  │            │ │
+│ │   (speed     │  │              │  │   A→B pairs)│  │            │ │
+│ │   limit,     │  │              │  │             │  │            │ │
+│ │   one-way,   │  │              │  │             │  │            │ │
+│ │   toll)      │  │              │  │             │  │            │ │
+│ └──────────────┘  └──────────────┘  └─────────────┘  └────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive

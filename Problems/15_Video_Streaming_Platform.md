@@ -49,36 +49,85 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐                    ┌──────────────┐
-│  Upload      │                    │  Viewer      │
-│  Client      │                    │  Client      │
-└──────┬───────┘                    └──────┬───────┘
-       │                                   │
-┌──────▼───────┐                    ┌──────▼───────┐
-│  Upload      │                    │     CDN      │  ← Edge servers worldwide
-│  Service     │                    │  (Akamai/    │
-│              │                    │  CloudFront) │
-└──────┬───────┘                    └──────┬───────┘
-       │                                   │ (cache miss)
-┌──────▼───────┐                    ┌──────▼───────┐
-│  Object      │                    │  Origin      │
-│  Store (S3)  │                    │  Storage     │
-│  (Original)  │                    │  (Transcoded)│
-└──────┬───────┘                    └──────────────┘
-       │
-┌──────▼─────────────────────────────────────┐
-│         Video Processing Pipeline          │
-│  ┌────────┐ ┌────────┐ ┌────────┐ ┌──────┐│
-│  │ Trans- │ │Thumbnail│ │Content │ │ DRM  ││
-│  │ coding │ │ Gen    │ │Moderat.│ │Encrypt││
-│  └────────┘ └────────┘ └────────┘ └──────┘│
-└──────┬─────────────────────────────────────┘
-       │
-┌──────▼───────┐     ┌──────────────┐     ┌──────────────┐
-│  Video       │     │  Search      │     │ Recommend.   │
-│  Metadata DB │     │  Service     │     │ Service      │
-│  (MySQL)     │     │ (Elasticsrch)│     │ (ML)         │
-└──────────────┘     └──────────────┘     └──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                     Upload Client                 Viewer Client      │
+│                     ┌──────────┐                  ┌──────────┐       │
+│                     │ pre-signed│                  │ HLS/DASH │       │
+│                     │ S3 upload │                  │ player   │       │
+│                     └─────┬────┘                  └─────┬────┘       │
+└───────────────────────────┼──────────────────────────────┼───────────┘
+                            │                              │
+                     ┌──────▼───────┐               ┌──────▼───────┐
+                     │  Upload      │               │     CDN      │
+                     │  Service     │               │ (Edge Servers│
+                     │              │               │  worldwide)  │
+                     │ • Pre-signed │               └──────┬───────┘
+                     │   URL gen    │                      │ cache miss
+                     │ • Metadata   │               ┌──────▼───────┐
+                     │   insert     │               │  Origin      │
+                     │ • Publish    │               │  Storage (S3)│
+                     │   event      │               │ (Transcoded  │
+                     └──────┬───────┘               │  HLS/DASH)   │
+                            │                       └──────────────┘
+                     ┌──────▼───────┐                      ▲
+                     │ Object Store │                      │
+                     │ (S3 — Raw)   │                      │
+                     └──────┬───────┘                      │
+                            │ S3 event                     │
+                     ┌──────▼───────┐                      │
+                     │    Kafka     │                      │
+                     │ (video-      │                      │
+                     │  uploaded)   │                      │
+                     └──────┬───────┘                      │
+                            │                              │
+┌───────────────────────────▼──────────────────────────────┤───────────┐
+│          Video Processing Pipeline (DAG Scheduler)       │           │
+│                                                          │           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │           │
+│  │ Split    │  │Transcode │  │Transcode │  │Transcode │ │           │
+│  │ into     │─▶│ 240p     │  │ 720p     │  │ 4K       │ │           │
+│  │ segments │  │ 360p     │  │ 1080p    │  │ (if src  │ │           │
+│  │ (10s)    │  │ 480p     │  │          │  │  is 4K)  │ │           │
+│  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘ │           │
+│       │                                                  │           │
+│       ├───▶ Thumbnail Gen ───┐                           │           │
+│       ├───▶ Content Moderation (ML: NSFW, violence) ─┐   │           │
+│       ├───▶ Audio Extraction → Audio Transcode ──┐   │   │           │
+│       └───▶ Subtitle (speech-to-text) ──┐        │   │   │           │
+│                                         │        │   │   │           │
+│  ┌──────────────────────────────────────▼────────▼───▼───▼┐          │
+│  │ Merge + HLS/DASH Packaging + DRM Encryption            │          │
+│  │ (.m3u8 manifest + .ts segments + Widevine/FairPlay)     │──upload─▶│
+│  └─────────────────────────────────────────────────────────┘          │
+│                                                                       │
+│  DAG Scheduler: Temporal / Airflow / Step Functions                   │
+│  Orchestrates task dependencies, retries, parallel fanout             │
+└───────────────────────────────────────────────────────────────────────┘
+                            │
+                     ┌──────▼───────┐
+                     │    Kafka     │
+                     │ (video-ready,│
+                     │  view-events)│
+                     └──────┬───────┘
+                            │
+         ┌──────────────────┼──────────────────┐
+         │                  │                  │
+  ┌──────▼───────┐   ┌─────▼──────┐    ┌──────▼───────┐
+  │  Video       │   │ Search     │    │ View Count   │
+  │  Metadata DB │   │ Service    │    │ Aggregation  │
+  │  (MySQL)     │   │(Elasticsearch)  │ (Kafka→Flink │
+  │              │   │            │    │  →Redis INCR │
+  │  title, desc,│   │ full-text  │    │  →ClickHouse)│
+  │  tags, status│   │ + filters  │    │              │
+  └──────────────┘   └────────────┘    └──────────────┘
+                                       
+  ┌──────────────┐
+  │ Recommend.   │
+  │ Service (ML) │
+  │ collab filter│
+  │ + content    │
+  │ embeddings   │
+  └──────────────┘
 ```
 
 ### Component Deep Dive
@@ -163,6 +212,49 @@ Quality Playlist (720p/playlist.m3u8):
 - **Deep learning**: Video embeddings (analyze visual/audio content)
 - **Features**: Watch history, watch duration (did they finish?), likes, search history
 - **Serving**: Pre-compute recommendations offline (Spark) → cache in Redis → serve in < 50 ms
+
+#### View Count Aggregation Pipeline
+Real-time view counting at scale (millions of concurrent viewers per popular video):
+
+1. **Client** sends "view" event → buffered on API server for 5 seconds
+2. **Kafka** topic `view-events` absorbs the write burst (append-only, handles 1M+ msgs/sec)
+3. **Flink** streaming job aggregates per video per minute → reduces millions of events to thousands of writes
+4. **Redis** `INCR view_count:{video_id}` for real-time approximate display count (batch-flushed every 5 seconds)
+5. **ClickHouse** stores granular view data for analytics (per-country, per-device, per-minute breakdowns)
+6. Hourly reconciliation batch job: exact count from ClickHouse → update Redis and MySQL metadata
+
+Why not `UPDATE videos SET view_count = view_count + 1`? At 1M concurrent viewers → 1M write transactions/sec on a single row → database lock contention → crush the DB. The pipeline reduces this to a few hundred writes/sec.
+
+#### DAG Scheduler (Pipeline Orchestrator)
+The video processing pipeline has task dependencies that form a DAG:
+
+```
+Split video into segments
+  ├─→ Transcode 240p ──┐
+  ├─→ Transcode 360p ──┤
+  ├─→ Transcode 720p ──┤
+  ├─→ Transcode 1080p ─┤
+  ├─→ Transcode 4K ────┤
+  ├─→ Generate Thumbnails ──┐
+  ├─→ Content Moderation ───┤
+  ├─→ Extract Audio ─→ Transcode Audio ──┤
+  └─→ Speech-to-Text (Subtitles) ────────┤
+                                          ▼
+                               Merge + HLS/DASH Package + DRM Encrypt
+                                          │
+                                    Upload to Origin S3
+```
+
+- **Orchestrator options**: Temporal (recommended for complex workflows), AWS Step Functions, Apache Airflow
+- **Why a DAG scheduler?** Tasks can run in parallel (all transcode jobs are independent) but merge must wait for ALL to complete. A simple queue can't express this.
+- **Retries**: Each task retries independently — if 720p transcode fails, only that task retries (not the entire pipeline)
+- **Monitoring**: Per-task status, overall pipeline progress, SLA tracking (99% of videos processing < 30 minutes)
+
+#### Search Service (Elasticsearch)
+- **Indexed fields**: Video title, description, tags, channel name, transcript (from speech-to-text)
+- **Features**: Full-text search with BM25 ranking, fuzzy matching ("spidermn" → "Spider-Man"), autocomplete
+- **Sync**: Video metadata changes in MySQL → Kafka CDC → Elasticsearch consumer updates index (< 2 second lag)
+- **Filters**: Upload date, duration, resolution, channel, category
 
 ---
 

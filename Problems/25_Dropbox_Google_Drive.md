@@ -50,37 +50,86 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────────┐
-│   Desktop Client │  ← Local file watcher + sync engine
-│   (Sync Agent)   │
-└──────┬───────────┘
-       │
-       ├──── Metadata changes ──────┐
-       │                            │
-       ├──── File chunks (upload) ──┼──────────────────────┐
-       │                            │                      │
-┌──────▼───────┐            ┌───────▼──────┐        ┌──────▼──────┐
-│ API Gateway  │            │  Block       │        │  Notification│
-└──────┬───────┘            │  Server      │        │  Service     │
-       │                    │ (chunking +  │        │ (WebSocket/  │
-┌──────▼───────┐            │  upload)     │        │  Long Poll)  │
-│  Metadata    │            └───────┬──────┘        └──────────────┘
-│  Service     │                    │
-│              │            ┌───────▼──────┐
-└──────┬───────┘            │  Object Store│
-       │                    │  (S3 / GCS)  │
-┌──────▼───────┐            │  (Chunks)    │
-│  Metadata DB │            └──────────────┘
-│  (PostgreSQL │
-│   + Redis)   │
-└──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         CLIENTS                                        │
+│                                                                        │
+│  ┌────────────────────────────────────────────────────────────┐        │
+│  │  Desktop / Mobile Sync Agent                               │        │
+│  │                                                            │        │
+│  │  • File watcher: detects local file changes (OS events)   │        │
+│  │  • Chunker: CDC (content-defined chunking) with Rabin hash │        │
+│  │  • Sync engine: compare local chunk list vs server metadata│        │
+│  │  • Delta upload: only send new/changed chunks             │        │
+│  │  • Dedup: skip chunks already in cloud (by SHA-256 hash)  │        │
+│  │  • Offline queue: queue changes when disconnected          │        │
+│  └──────────────────────┬─────────────────────────────────────┘        │
+│                         │                                              │
+└─────────────────────────│──────────────────────────────────────────────┘
+                          │
+           ┌──────────────┼──────────────────────────────┐
+           │              │                              │
+    Upload │       Metadata│changes               Receive│notifications
+    chunks │              │                              │
+           │              │                              │
+┌──────────▼──┐   ┌──────▼───────┐          ┌───────────▼──────────────┐
+│ Block Server│   │ API Gateway  │          │ Notification Service     │
+│             │   └──────┬───────┘          │                          │
+│ • Receive   │          │                  │ • WebSocket / Long Poll  │
+│   chunk +   │   ┌──────▼───────┐          │   per connected client   │
+│   SHA-256   │   │ Metadata     │          │ • Consume file-changed   │
+│ • Verify    │   │ Service      │          │   events from Kafka      │
+│   integrity │   │              │          │ • Push to all devices    │
+│ • Compress  │   │ • File tree  │          │   + shared users         │
+│   (LZ4)     │   │ • Chunk refs │          │ • Offline → query on     │
+│ • Encrypt   │   │ • Versions   │          │   reconnect (since=ts)   │
+│   (AES-256) │   │ • Sharing    │          └──────────────────────────┘
+│ • Upload    │   │   permissions│
+│   to S3     │   │ • On update: │
+│             │   │   publish    │
+│ • Dedup:    │   │   file-changed│
+│   check     │   │   to Kafka   │
+│   hash      │   │              │
+│   first     │   └──────┬───────┘
+└──────┬──────┘          │
+       │          ┌──────▼───────────────────────────────────┐
+┌──────▼──────┐   │  DATA LAYER                              │
+│ Object Store│   │                                          │
+│ (S3 / GCS)  │   │  ┌──────────────┐    ┌──────────────┐   │
+│             │   │  │ PostgreSQL   │    │ Redis        │   │
+│ /chunks/    │   │  │              │    │              │   │
+│  {sha256}/  │   │  │ • files      │    │ • file meta  │   │
+│  data       │   │  │ • versions   │    │ • user       │   │
+│             │   │  │ • chunk_refs │    │   session    │   │
+│ Content-    │   │  │ • shares     │    │ • dedup      │   │
+│ addressed:  │   │  │ • namespaces │    │   bloom      │   │
+│ same hash = │   │  │              │    │   filter     │   │
+│ same chunk  │   │  │ Source of    │    │              │   │
+│ (global     │   │  │ truth for    │    │              │   │
+│  dedup)     │   │  │ all metadata │    │              │   │
+└─────────────┘   │  └──────────────┘    └──────────────┘   │
+                  │                                          │
+                  │  ┌──────────────┐                        │
+                  │  │ Kafka        │                        │
+                  │  │              │                        │
+                  │  │ file-changed │ → Notification Service │
+                  │  │ events       │ → Sync workers         │
+                  │  │              │ → Search index (ES)    │
+                  │  └──────────────┘                        │
+                  │                                          │
+                  └──────────────────────────────────────────┘
 
-Sync Flow:
-┌──────────────┐     ┌──────────────┐
-│  Message     │────▶│  Sync        │
-│  Queue       │     │  Service     │
-│  (Kafka)     │     │              │
-└──────────────┘     └──────────────┘
+CONFLICT RESOLUTION:
+  Device A (offline edit)    Device B (online edit)
+       │                          │
+       │   both edit same file    │
+       │                          │
+       └───────────┬──────────────┘
+                   │
+            Server detects conflict
+            (version mismatch on metadata update)
+                   │
+            Save both: report.pdf + report (Alice's conflicted copy).pdf
+            User manually resolves
 ```
 
 ### Component Deep Dive

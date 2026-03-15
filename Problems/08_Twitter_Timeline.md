@@ -47,38 +47,108 @@
 ```
 ┌──────────────┐
 │    Client    │
+│ (Web/Mobile) │
 └──────┬───────┘
        │
 ┌──────▼───────┐
-│ API Gateway  │
+│ API Gateway  │  ← Auth (JWT), rate limit, routing
 └──────┬───────┘
        │
-       ├────────────────────┬───────────────────┬─────────────────┐
-       │                    │                   │                 │
-┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐  ┌──────▼──────┐
-│ Tweet       │     │ Timeline    │     │  Search     │  │  Trending   │
-│ Service     │     │ Service     │     │  Service    │  │  Service    │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘  └──────┬──────┘
-       │                    │                   │                 │
-┌──────▼──────┐     ┌──────▼──────┐     ┌──────▼──────┐  ┌──────▼──────┐
-│   Kafka     │     │  Redis      │     │Elasticsearch│  │ Apache      │
-│(tweet-events│     │  (Timeline  │     │  (Search    │  │ Flink       │
-│  topic)     │     │   Cache)    │     │   Index)    │  │ (Streaming) │
-└──────┬──────┘     └─────────────┘     └─────────────┘  └──────┬──────┘
-       │                                                        │
-       ├──────────────────────────────────────┐          ┌──────▼──────┐
-       │                                      │          │   Redis     │
-┌──────▼──────┐                        ┌──────▼──────┐   │ (Trending  │
-│  Fan-out    │                        │ Social Graph│   │  Cache)    │
-│  Service    │                        │  Service    │   └─────────────┘
-└──────┬──────┘                        └─────────────┘
+       ├──────────────────────────────────────────────────────┐
+       │ WRITE PATH (post tweet)              READ PATH      │
+       │                                      (get timeline) │
+┌──────▼──────┐                         ┌────────────────────▼──┐
+│ Tweet       │                         │  Timeline Service     │
+│ Service     │                         │                       │
+│             │                         │  1. Fetch pre-computed│
+│ • Validate  │                         │     feed from Redis   │
+│   (280 char,│                         │     (fan-out-on-write)│
+│   content   │                         │  2. Fetch celebrity   │
+│   mod)      │                         │     tweets on-the-fly │
+│ • Store in  │                         │     (fan-out-on-read) │
+│   MySQL     │                         │  3. Merge + Rank via  │
+│ • Media →   │                         │     ML scoring        │
+│   S3 + CDN  │                         │  4. Hydrate tweet IDs │
+│ • Publish   │                         │     with full objects  │
+│   event     │                         └──────┬──────┬─────────┘
+└──────┬──────┘                                │      │
+       │                                 ┌─────▼───┐  │
+┌──────▼──────┐                          │  Redis  │  │
+│    Kafka    │                          │(Timeline│  │
+│(tweet-events│                          │ Cache   │  │
+│ topic)      │                          │ ZSET per│  │
+└──────┬──────┘                          │ user)   │  │
+       │                                 └─────────┘  │
+       ├──────────────────────────┐                   │
+       │                         │              ┌─────▼──────┐
+┌──────▼──────┐           ┌──────▼──────┐       │ ML Ranking │
+│ Fan-Out     │           │ Social Graph│       │ Service    │
+│ Service     │           │ Service     │       │            │
+│             │           │             │       │ Score =    │
+│ For each    │◄─────────▶│ Redis:      │       │ recency +  │
+│ tweet:      │ get        │ followers:  │       │ engagement+│
+│             │ followers  │ {uid} → SET │       │ affinity + │
+│ If < 10K:   │           │             │       │ content    │
+│  → ZADD to  │           │ MySQL:      │       │ relevance  │
+│    each      │           │ durable     │       └────────────┘
+│    follower's│           │ follow      │
+│    Redis feed│           │ graph       │
+│             │           └─────────────┘
+│ If ≥ 10K:   │
+│  → skip     │
+│  (celebrity, │
+│   pull on   │
+│   read)     │
+└──────┬──────┘
        │
-┌──────▼──────┐
-│  MySQL /    │
-│  Cassandra  │
-│ (Tweet Store│
-│  + Timeline)│
-└─────────────┘
+       │     ┌──────────────────────────────────────────────────┐
+       │     │           ASYNC CONSUMERS (Kafka)                │
+       │     │                                                  │
+       ├────▶│  ┌──────────────┐  ┌──────────────┐             │
+       │     │  │ Search       │  │ Trending     │             │
+       │     │  │ Indexer      │  │ Service      │             │
+       │     │  │              │  │              │             │
+       │     │  │ → Elastic    │  │ Flink:       │             │
+       │     │  │   Search     │  │ • Extract    │             │
+       │     │  │ (full-text,  │  │   hashtags   │             │
+       │     │  │  hashtags,   │  │ • 5-min      │             │
+       │     │  │  mentions)   │  │   sliding    │             │
+       │     │  │              │  │   window     │             │
+       │     │  │              │  │ • Velocity   │             │
+       │     │  │              │  │   scoring    │             │
+       │     │  │              │  │ • Top-K →    │             │
+       │     │  │              │  │   Redis      │             │
+       │     │  └──────────────┘  └──────────────┘             │
+       │     │                                                  │
+       │     │  ┌──────────────┐  ┌──────────────┐             │
+       │     │  │ Notification │  │ Analytics    │             │
+       │     │  │ Service      │  │ Pipeline     │             │
+       │     │  │              │  │              │             │
+       │     │  │ • "@mention" │  │ Flink →      │             │
+       │     │  │   push notif │  │ ClickHouse   │             │
+       │     │  │ • "X liked"  │  │              │             │
+       │     │  │ • "X retweeted"│ │ Engagement  │             │
+       │     │  │ • APNs/FCM   │  │ metrics,    │             │
+       │     │  │              │  │ creator dash │             │
+       │     │  └──────────────┘  └──────────────┘             │
+       │     └──────────────────────────────────────────────────┘
+       │
+┌──────▼──────────────────────────────────────────────────────────┐
+│                       DATA LAYER                                 │
+│                                                                   │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │ MySQL /      │  │    Redis     │  │   Cassandra          │   │
+│  │ PostgreSQL   │  │              │  │   (User Timelines)   │   │
+│  │              │  │ • Home       │  │                      │   │
+│  │ • Tweets     │  │   timeline   │  │ PK: user_id          │   │
+│  │ • Users      │  │   per user   │  │ CK: tweet_id (desc)  │   │
+│  │ • Follows    │  │   (ZSET)     │  │                      │   │
+│  │              │  │ • Follower   │  │ For user profile      │   │
+│  │ Sharded by   │  │   SETs       │  │ "show me my tweets"  │   │
+│  │ user_id      │  │ • Trending   │  │                      │   │
+│  │              │  │   (ZSET)     │  │                      │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Hybrid Fan-Out Strategy (Same as News Feed — Critical for Twitter)
@@ -141,6 +211,22 @@ Twitter's core architectural challenge:
 - Stores follow/following relationships
 - **Redis**: For fast lookups during fan-out (`followers:{user_id}` → SET)
 - **MySQL**: Durable storage for relationships
+
+#### Notification Service
+- Consumes events from Kafka (`tweet-events`, `like-events`, `retweet-events`, `follow-events`)
+- **Triggers**:
+  - `@mention` in a tweet → push notification to mentioned user
+  - Like/retweet → notification to tweet author (batched: "Alice and 15 others liked your tweet")
+  - New follower → "X started following you"
+  - Reply → notification to parent tweet author
+- **Channels**: APNs (iOS), FCM (Android), in-app notification tab, email digest (daily/weekly)
+- **Batching**: Collapse multiple similar events to avoid notification spam (e.g., 50 likes → 1 push)
+
+#### ML Ranking Service
+- Timeline is NOT purely reverse-chronological — it's ranked by relevance
+- **Features**: tweet recency, engagement velocity (likes/retweets per minute), user affinity (how often you interact with author), content type (image/video/text), author verification status
+- **Model**: Lightweight gradient boosted tree for online scoring (< 10ms per candidate set)
+- **Fallback**: If ranking service is unavailable → return reverse-chronological feed
 
 ---
 
@@ -335,4 +421,127 @@ CREATE TABLE follows (
 - Pre-publish: ML classifier checks for hate speech, spam, misinformation
 - Post-publish: User reports → moderation queue → human review
 - Automated actions: Shadow ban (reduce visibility), warning labels, account suspension
+
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Home Timeline Assembly — The Merge Walkthrough
+
+```
+User B opens home feed. B follows 300 normal users + 5 celebrities.
+
+Step 1: Fetch pre-computed timeline from Redis (1 ms)
+  ZREVRANGEBYSCORE timeline:home:{B} +inf -inf LIMIT 0 200
+  → Returns ~200 tweet_ids from fan-out-on-write results
+  These are tweets from B's 300 normal followees, already placed here
+  at write time by the Fan-out Service.
+
+Step 2: Fetch celebrity tweets (5 parallel Redis calls, 2 ms)
+  For each celebrity B follows:
+    ZREVRANGEBYSCORE timeline:user:{celeb_id} {now} {now - 24h} LIMIT 0 20
+  → Returns ~100 recent tweet_ids from 5 celebrities
+  These were NOT pre-computed into B's timeline (fan-out-on-read)
+
+Step 3: Merge and Rank (5 ms in-process)
+  Combine 200 + 100 = 300 candidate tweet_ids
+  
+  For each candidate, compute ranking score:
+    score = α × recency + β × engagement + γ × affinity + δ × content_type
+    
+    recency:      decay function → tweets from 5 min ago > 5 hours ago
+    engagement:   like_count + 2 × retweet_count + 3 × reply_count
+    affinity:     how often does B interact with this author?
+                  (likes, replies, profile views in last 30 days)
+    content_type: photos > text > links (engagement data shows this)
+  
+  Sort by score → top 20 for the first page
+  
+  Reverse-chronological as fallback:
+    If user has algorithmic timeline disabled → sort by timestamp only
+    (Twitter's "Latest Tweets" toggle)
+
+Step 4: Hydrate tweet objects (3 ms)
+  For each of top 20 tweet_ids:
+    Fetch full tweet from Tweet Cache (Redis hash):
+      HGETALL tweet:{tweet_id}
+    If cache miss → fetch from Cassandra, populate cache
+  
+  Attach: author profile (from User Cache), engagement counts,
+          whether B has liked/retweeted it, conversation thread context
+
+Step 5: Return to client (total: ~12 ms)
+  {
+    "tweets": [ fully hydrated tweet objects ],
+    "next_cursor": "tweet_id_of_200th_item"
+  }
+
+Why the merge doesn't bottleneck:
+  Pre-computed (step 1): O(1) Redis read for the common case
+  Celebrity fetch (step 2): only 5 calls, not 5 million
+  Ranking (step 3): 300 candidates × simple arithmetic = microseconds
+  The genius: 99.9% of the work (fan-out to 300 followees) was done at WRITE time
+```
+
+### The Celebrity Threshold — 10K Followers, Why?
+
+```
+Fan-out-on-write cost per tweet:
+  1 tweet × N followers = N Redis ZADD operations
+  
+  N = 100 followers:   100 ZADDs → < 1 ms → trivially fast
+  N = 10,000:          10K ZADDs → ~10 ms → acceptable
+  N = 100,000:         100K ZADDs → ~100 ms → starting to hurt
+  N = 50,000,000:      50M ZADDs → ~50 seconds → IMPOSSIBLE per tweet
+  
+  Celebrity tweets: 10-50 per day × 50M ZADDs = 500M-2.5B writes/day from ONE user
+  That's more than the entire non-celebrity fan-out combined.
+
+Threshold choice:
+  At 10K: fan-out cost is ~10 ms → acceptable with batching
+  Below 10K: 99.9% of users, and their fan-out completes in < 10 ms
+  Above 10K: ~0.1% of users, but they generate 80%+ of fan-out writes
+  
+  Dynamic threshold: can be tuned per system load
+    During low traffic (2 AM): raise to 50K (pre-compute more)
+    During peak (Super Bowl): lower to 5K (reduce fan-out load)
+
+Fallback if fan-out is slow:
+  Fan-out workers lag behind (spike in tweets)
+  User opens feed → pre-computed timeline is stale (missing recent tweets)
+  Solution: Timeline Service detects staleness (last_updated > 30s ago)
+    → falls back to fan-out-on-read for ALL followees (not just celebrities)
+    → slower but always fresh
+    → cached result used for subsequent reads until fan-out catches up
+```
+
+### Delete Propagation — The Consistency Challenge
+
+```
+User tweets → fan-out to 5000 followers → user deletes tweet
+
+Deletion must undo the fan-out:
+  1. Mark tweet as deleted in DB (soft delete, instant)
+  2. Publish tweet-deleted event to Kafka
+  3. Fan-out Service: for each of 5000 followers:
+       ZREM timeline:home:{follower} {tweet_id}
+     This takes ~5 ms (same speed as fan-out-on-write)
+  4. Remove from Elasticsearch search index
+  
+Problem: between steps 1 and 3, some followers may still SEE the tweet
+  They fetch their timeline → tweet_id is there → hydrate from cache → 
+  cache still has the tweet? Maybe.
+  
+  Solution: Tweet Cache check
+    During hydration (Step 4 of timeline assembly):
+    Fetch tweet from cache → check is_deleted flag → if deleted, skip
+    Even if timeline still has the tweet_id, it's filtered out at read time
+    
+    Belt and suspenders: deletion in timeline (eventual) + filtering at read (immediate)
+
+Celebrity tweet deletion:
+  Celebrity deletes tweet → no fan-out to undo (was never written to followers)
+  Just mark as deleted in DB → when followers do fan-out-on-read,
+  the celebrity's timeline no longer includes it → naturally disappears
+```
 

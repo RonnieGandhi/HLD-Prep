@@ -45,39 +45,157 @@
 ## 4. High-Level Design (HLD)
 
 ```
-                              ┌──────────────┐
-                              │   Clients    │
-                              └──────┬──��────┘
-                                     │
-                              ┌──────▼───────┐
-                              │  Client Lib  │  ← Consistent hashing to find node
-                              │  / Coord.    │
-                              └──────┬───────┘
-                                     │
-           ┌─────────────────────────┼─────────────────────────┐
-           │                         │                         │
-    ┌──────▼──────┐          ┌──────▼──────┐          ┌──────▼──────┐
-    │   Node A    │          │   Node B    │          │   Node C    │
-    │ ┌─────────┐ │          │ ┌─────────┐ │          │ ┌─────────┐ │
-    │ │MemTable │ │          │ │MemTable │ │          │ │MemTable │ │
-    │ │ (sorted │ │          │ │         │ │          │ │         │ │
-    │ │  skiplist│ │          │ │         │ │          │ │         │ │
-    │ └────┬────┘ │          │ └────┬────┘ │          │ └────┬────┘ │
-    │ ┌────▼────┐ │          │ ┌────▼────┐ │          │ ┌────▼────┐ │
-    │ │  WAL    │ │          │ │  WAL    │ │          │ │  WAL    │ │
-    │ └────┬────┘ │          │ └────┬────┘ │          │ └────┬────┘ │
-    │ ┌────▼────┐ │          │ ┌────▼────┐ │          │ ┌────▼────┐ │
-    │ │SSTables │ │          │ │SSTables │ │          │ │SSTables │ │
-    │ │ (L0-LN) │ │          │ │ (L0-LN) │ │          │ │ (L0-LN) │ │
-    │ └─────────┘ │          │ └─────────┘ │          │ └─────────┘ │
-    └──────┬──────┘          └──────┬──────┘          └──────┬──────┘
-           │                         │                         │
-           └─────────────────────────┼─────────────────────────┘
-                                     │
-                              ┌──────▼───────┐
-                              │  Gossip      │  ← Failure detection + membership
-                              │  Protocol    │
-                              └──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                            CLIENT                                      │
+│                                                                        │
+│  put(key, value, consistency=QUORUM)                                  │
+│  get(key, consistency=QUORUM)                                         │
+└───────────────────────────┬────────────────────────────────────────────┘
+                            │
+┌───────────────────────────▼────────────────────────────────────────────┐
+│                    CLIENT LIBRARY / COORDINATOR                        │
+│                                                                        │
+│  1. Hash key → position on consistent hash ring                       │
+│     slot = hash(key) % 2^128                                          │
+│  2. Walk clockwise → find first node (= coordinator)                  │
+│  3. Coordinator handles request:                                       │
+│                                                                        │
+│  WRITE PATH:                          READ PATH:                       │
+│  ┌─────────────────────────────┐      ┌─────────────────────────────┐  │
+│  │ 1. Append to local WAL     │      │ 1. Send read to N replicas  │  │
+│  │    (fsync for durability)   │      │ 2. Wait for R responses     │  │
+│  │ 2. Write to MemTable       │      │ 3. Return highest timestamp │  │
+│  │    (in-memory skip list)   │      │ 4. If versions differ →     │  │
+│  │ 3. Forward to N-1 replicas │      │    READ REPAIR: send latest │  │
+│  │ 4. Wait for W acks         │      │    to stale replicas        │  │
+│  │ 5. Return success to client│      │                             │  │
+│  │                            │      │ Read from each node:        │  │
+│  │ If a replica is DOWN:      │      │  a. Check MemTable (newest) │  │
+│  │  → Hinted Handoff: write   │      │  b. Check Bloom Filters     │  │
+│  │    to substitute node with │      │     per SSTable             │  │
+│  │    hint = {target, data}   │      │  c. If BF says "maybe" →   │  │
+│  │  → When target recovers,  │      │     read SSTable index →    │  │
+│  │    forward hinted data     │      │     read data block         │  │
+│  └─────────────────────────────┘      │  d. Return first match     │  │
+│                                       └─────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                    CONSISTENT HASH RING                                 │
+│                                                                        │
+│           vnode_A3        vnode_B1                                     │
+│              ╲              ╱                                          │
+│    vnode_C2 ── ○────○────○ ── vnode_A1                                │
+│              ╱   RING      ╲                                          │
+│    vnode_B3 ── ○────○────○ ── vnode_C1                                │
+│              ╲              ╱                                          │
+│           vnode_A2        vnode_B2                                     │
+│                                                                        │
+│  Each physical node → 150-200 virtual nodes on ring                   │
+│  Key hashes to a position → walk clockwise to first vnode             │
+│  Next N-1 DISTINCT physical nodes = replicas                          │
+│  Adding a node: only ~1/N of keys migrate (minimal disruption)        │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                    STORAGE NODE (each of N nodes)                       │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  MemTable (In-Memory)                                            │  │
+│  │  • Sorted skip list (O(log n) insert/lookup)                    │  │
+│  │  • Threshold: 64 MB → flush to disk as immutable SSTable         │  │
+│  │  • Concurrent reads during flush (swap to new MemTable)          │  │
+│  └──────────────────────┬───────────────────────────────────────────┘  │
+│                         │ flush (when 64 MB)                           │
+│  ┌──────────────────────▼───────────────────────────────────────────┐  │
+│  │  WAL (Write-Ahead Log)                                           │  │
+│  │  • Append-only file, fsynced on every write (durability)        │  │
+│  │  • On crash: replay WAL to reconstruct MemTable                 │  │
+│  │  • Format: | CRC | timestamp | key_len | val_len | key | value | │  │
+│  │  • Truncated after MemTable flush completes                     │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                         │                                              │
+│  ┌──────────────────────▼───────────────────────────────────────────┐  │
+│  │  SSTables (Sorted String Tables — Immutable on Disk)             │  │
+│  │                                                                  │  │
+│  │  Level 0: [SST-1] [SST-2] [SST-3]  ← freshly flushed, may      │  │
+│  │                                       overlap in key ranges      │  │
+│  │  Level 1: [SST-A─────────] [SST-B─────────]  ← compacted,      │  │
+│  │                                                 non-overlapping  │  │
+│  │  Level 2: [SST-X───────────────] [SST-Y───────────────]         │  │
+│  │                                                                  │  │
+��  │  Each SSTable contains:                                          │  │
+│  │   • Data blocks (sorted key-value pairs, compressed)            │  │
+│  │   • Sparse index (key → block offset)                           │  │
+│  │   • Bloom filter (false positive ~1%, eliminates 99% disk reads)│  │
+│  │   • Footer (metadata, compression codec, checksum)              │  │
+│  │                                                                  │  │
+│  │  Compaction (background):                                        │  │
+│  │   • Size-tiered: merge similarly-sized SSTables (write-optimized)│  │
+│  │   • Leveled: non-overlapping levels, 10× size growth per level  │  │
+│  │     (read-optimized)                                             │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Merkle Tree (Anti-Entropy)                                      │  │
+│  │                                                                  │  │
+│  │  • One per key range owned by this node                         │  │
+│  │  • Leaf = hash(key + value)                                      │  │
+│  │  • Parent = hash(left_child + right_child)                      │  │
+│  │  • Periodically compare root hash with replica's root hash      │  │
+│  │  • If roots differ → walk tree to find divergent leaves         │  │
+│  │  • Sync only divergent keys (bandwidth-efficient repair)         │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                    CLUSTER MANAGEMENT                                   │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Gossip Protocol (Decentralized Failure Detection)               │  │
+│  │                                                                  │  │
+│  │  Every 1 second, each node:                                     │  │
+│  │   1. Pick a random peer                                          │  │
+│  │   2. Exchange membership state:                                  │  │
+│  │      {node_id, status, heartbeat_counter, token_ranges, load}   │  │
+│  │   3. Merge: take max(heartbeat_counter) per node                │  │
+│  │                                                                  │  │
+│  │  Failure detection: Phi Accrual Failure Detector                │  │
+│  │   • Track heartbeat inter-arrival times (mean + stddev)          │  │
+│  │   • phi = -log10(P(no heartbeat for this long))                 │  │
+│  │   • phi > 8 → declare node SUSPECT → after grace period → DEAD  │  │
+│  │   • Advantage over fixed timeout: adapts to network conditions   │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Hinted Handoff (Temporary Failure Handling)                     │  │
+│  │                                                                  │  │
+│  │  Node B is down. Write for key K (replicas = A, B, C):          │  │
+│  │   1. Coordinator writes to A and C (both alive)                 │  │
+│  │   2. For B's copy: write to substitute node D with hint:        │  │
+│  │      hint = {target: B, key: K, value: V, timestamp: T}        │  │
+│  │   3. When B recovers (detected via gossip):                     │  │
+│  │      D forwards all hinted data to B                            │  │
+│  │   4. D deletes the hints after B acknowledges                   │  │
+│  │                                                                  │  │
+│  │  Hint TTL: 3 hours (if B doesn't recover, hints are dropped    │  │
+│  │  and full repair via Merkle trees is needed)                    │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Conflict Resolution                                             │  │
+│  │                                                                  │  │
+│  │  Option 1 — Vector Clocks (Dynamo):                             │  │
+│  │   {node_A: 3, node_B: 1} vs {node_A: 2, node_C: 1}            │  │
+│  │   Neither dominates → CONFLICT → return both to client          │  │
+│  │   Client merges (application-aware resolution)                  │  │
+│  │                                                                  │  │
+│  │  Option 2 — Last-Write-Wins (Cassandra):                       │  │
+│  │   Compare timestamps → highest wins → simpler but may lose data │  │
+│  │   Use Hybrid Logical Clocks to avoid wall-clock skew issues     │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Architecture Components
@@ -95,20 +213,35 @@
 **Why LSM over B-Tree**: Optimized for write-heavy workloads (sequential disk writes)
 
 **Write Path**:
-1. Write to **WAL** (Write-Ahead Log) — append-only file for durability
-2. Write to **MemTable** — in-memory sorted data structure (Red-Black tree or Skip List)
-3. When MemTable reaches threshold (~64 MB) → flush to disk as an immutable **SSTable** (Sorted String Table)
+1. Write to **WAL** (Write-Ahead Log) — append-only file, fsynced on every write for durability
+   - Format per entry: `| CRC (4B) | Timestamp (8B) | Key_Len (4B) | Val_Len (4B) | Key | Value |`
+   - On crash: replay WAL entries to reconstruct the MemTable (no data loss)
+   - Truncated after MemTable successfully flushes to SSTable
+2. Write to **MemTable** — in-memory sorted skip list (O(log n) insert/lookup)
+3. When MemTable reaches threshold (~64 MB) → freeze current MemTable (still readable), create a new empty MemTable for new writes → flush frozen MemTable to disk as an immutable **SSTable**
 4. Background **compaction** merges SSTables to reduce read amplification
 
 **Read Path**:
-1. Check **MemTable** (most recent data)
-2. Check **Bloom Filter** for each SSTable (probabilistic: "definitely not here" or "maybe here")
-3. Check SSTables from newest to oldest
-4. Return first match found
+1. Check **MemTable** (most recent data, in-memory, fastest)
+2. Check **Bloom Filter** for each SSTable (probabilistic: "definitely not here" or "maybe here" — eliminates ~99% of unnecessary disk reads)
+3. If Bloom filter says "maybe" → check SSTable's sparse index → locate data block → read and decompress
+4. Check SSTables from newest to oldest (Level 0 first, then Level 1, etc.)
+5. Return first match found
+
+**SSTable Internal Structure**:
+- **Data blocks**: Sorted key-value pairs, compressed (LZ4/Snappy)
+- **Sparse index**: Every Nth key → block offset (binary search to find the right block)
+- **Bloom filter**: Per-SSTable, ~1% false positive rate with 10 bits per entry
+- **Footer**: Metadata, compression codec, format version, checksum
+
+**SSTable Levels**:
+- **Level 0**: Freshly flushed from MemTable — key ranges MAY overlap (multiple SSTables can contain the same key)
+- **Level 1+**: Compacted — key ranges are non-overlapping within a level (each key exists in at most one SSTable per level)
+- Each level is ~10× the size of the previous level
 
 **Compaction Strategies**:
-- **Size-Tiered Compaction**: Good for write-heavy (Cassandra default). Merge similarly-sized SSTables
-- **Leveled Compaction**: Good for read-heavy. SSTables organized into levels; each level is 10× the previous
+- **Size-Tiered Compaction (STCS)**: Merge similarly-sized SSTables when count exceeds threshold. Good for write-heavy workloads. Trade-off: high space amplification (up to 2× during compaction)
+- **Leveled Compaction (LCS)**: Promote SSTables from Level N to Level N+1, re-splitting to maintain non-overlapping ranges. Good for read-heavy workloads. Trade-off: high write amplification (rewrites entire level on merge)
 
 #### Replication
 - **Replication Factor (N)**: Configurable, default 3
@@ -124,11 +257,63 @@
 - **How**: Every node periodically (every 1 second) picks a random node and exchanges membership state
 - **Failure detection**: Uses **Phi Accrual Failure Detector** — calculates a suspicion level (phi) based on heartbeat intervals. Declares node dead when phi exceeds threshold (e.g., 8)
 - **Information propagated**: Node liveness, token ranges, load metrics
+- **Convergence**: With N nodes, information reaches all nodes in O(log N) gossip rounds (~10 rounds for 1000 nodes)
+
+#### Hinted Handoff (Temporary Failure Handling)
+- **When**: A write's designated replica is DOWN but the write must still succeed (AP system)
+- **How**:
+  1. Coordinator detects that replica B is unreachable
+  2. Instead of failing the write, coordinator writes B's copy to substitute node D
+  3. D stores the data with a hint: `{target: B, key: K, value: V, timestamp: T}`
+  4. When B recovers (detected via gossip heartbeat resuming), D forwards all hinted data to B
+  5. D deletes the hints after B acknowledges receipt
+- **Hint TTL**: 3 hours — if B doesn't recover within this window, hints are dropped. Full repair via Merkle trees is then needed to restore consistency.
+- **Sloppy quorum interaction**: During partitions, writes can go to ANY W available nodes (not necessarily the "correct" replicas). This is what makes the system AP — always writable.
+
+#### Anti-Entropy Repair (Merkle Trees)
+- **Purpose**: Detect and repair data inconsistencies between replicas that hinted handoff couldn't fix (e.g., node was down longer than hint TTL)
+- **How**:
+  1. Each node maintains a Merkle tree per key range it owns
+  2. Leaf node = hash(key + value) for each key-value pair
+  3. Parent node = hash(left_child + right_child)
+  4. Periodically (e.g., every hour), two replica nodes compare their Merkle tree root hashes
+  5. If roots match → replicas are identical, done
+  6. If roots differ → recursively walk down the tree comparing children until divergent leaf nodes are found
+  7. Only the divergent keys are synchronized between replicas
+- **Efficiency**: For 1 million keys, a Merkle tree has ~20 levels. If only 10 keys differ, you compare ~200 hashes (not 1 million) — O(log N × diff_count) bandwidth.
+- **Rebuild**: Merkle tree is rebuilt after compaction (SSTables changed)
+
+#### Conflict Resolution
+- **When**: Two clients write to the same key concurrently (or during a network partition)
+- **Option 1 — Vector Clocks (Amazon Dynamo)**:
+  - Each version carries a vector clock: `{node_A: 3, node_B: 1}`
+  - On read, compare vector clocks: if one dominates (all entries ≥), take the dominant one
+  - If neither dominates (concurrent) → **conflict** → return BOTH versions to the client → client merges (application-aware resolution, e.g., union of shopping cart items)
+  - **Problem**: Vector clock size grows with number of writers — mitigate by truncating oldest entries when clock exceeds N entries
+- **Option 2 — Last-Write-Wins (Cassandra)**:
+  - Compare timestamps → highest wins → other version silently discarded
+  - Simpler but can **lose data** — concurrent writes, one is dropped
+  - Use **Hybrid Logical Clocks (HLC)** instead of wall clock to avoid clock skew issues (HLC = max(wall_clock, last_HLC) + 1)
 
 #### Coordinator Node
-- **Role**: The node that receives the client request
-- **Write coordination**: Forwards write to all N replicas, waits for W acknowledgments
-- **Read coordination**: Sends read to all N replicas, waits for R responses, returns the one with the highest timestamp
+- **Role**: The node that receives the client request (determined by consistent hashing of the key)
+- **Write coordination**:
+  1. Append to local WAL (fsync for durability — survives crashes)
+  2. Write to local MemTable (in-memory, fast)
+  3. Forward write to N-1 replica nodes in parallel
+  4. Wait for W total acknowledgments (including own)
+  5. Return success to client
+  - **If a replica is DOWN**: Coordinator uses **Hinted Handoff** — writes the data to a substitute node with a hint `{target: dead_node, key, value, timestamp}`. When the target recovers, the substitute forwards the hinted data.
+- **Read coordination**:
+  1. Send read request to all N replica nodes in parallel
+  2. Wait for R responses
+  3. Return the value with the highest timestamp (or latest vector clock) to the client
+  4. **Read Repair**: If the R responses contain different versions, the coordinator sends the latest version to the stale replicas in the background — eventually converges all replicas
+  - **Per-node read flow** (what each replica does on receiving a read):
+    - a. Check MemTable (newest data, in-memory)
+    - b. Check Bloom Filter for each SSTable — if BF says "definitely not here," skip that SSTable entirely (saves disk I/O)
+    - c. If BF says "maybe" → read SSTable's sparse index → find the data block offset → read and decompress the data block
+    - d. Return the first match found (newest SSTable first)
 
 ---
 

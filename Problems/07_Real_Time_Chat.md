@@ -46,42 +46,107 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐    ┌──────────────┐
-│   Client A   │    │   Client B   │
-│  (Mobile/Web)│    │  (Mobile/Web)│
-└──────┬───────┘    └──────┬───────┘
-       │ WebSocket          │ WebSocket
-       │                    │
-┌──────▼───────┐    ┌──────▼───────┐
-│  Chat Server │    │  Chat Server │
-│  (WS Handler)│    │  (WS Handler)│
-│  Instance 1  │    │  Instance 2  │
-└─��────┬───────┘    └──────┬───────┘
-       │                    │
-       ├────────────────────┤
-       │                    │
-┌──────▼────────────────────▼───────┐
-│         Message Router            │  ← Routes between chat servers
-│      (Kafka / Redis Pub-Sub)      │
-└──────┬────────────────────┬───────┘
-       │                    │
-┌──────▼───────┐    ┌──────▼───────┐
-│  Session     │    │  Message     │
-│  Service     │    │  Service     │
-│ (who's on    │    │ (persist &   │
-│  which server)│   │  retrieve)   │
-└──────┬───────┘    └──────┬───────┘
-       │                    │
-┌──────▼───────┐    ┌──────▼───────┐
-│    Redis     │    │  Cassandra   │
-│ (Session +   │    │  (Message    │
-│  Presence)   │    │   Store)     │
-└──────────────┘    └──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         CLIENTS                                        │
+│                                                                        │
+│  ┌──────────────────────────────────────────────┐                      │
+│  │  Client (Mobile / Web / Desktop)              │                      │
+│  │                                                │                      │
+│  │  • Local message DB (SQLite / IndexedDB)      │                      │
+│  │  • E2EE: encrypt with recipient's public key  │                      │
+│  │  • WebSocket for real-time send/receive        │                      │
+│  │  • Sync: track last_synced_message_id          │                      │
+│  │  • Typing indicator (ephemeral, no persist)    │                      │
+│  └──────────────────────┬────────────────────────┘                      │
+│                         │ WebSocket (persistent, full-duplex)           │
+└─────────────────────────│───────────────────────────────────────────────┘
+                          │
+┌─────────────────────────│───────────────────────────────────────────────┐
+│                  CHAT SERVER LAYER (Stateful)                           │
+│                         │                                               │
+│  L4 LB (consistent hash on user_id for sticky sessions)               │
+│                         │                                               │
+│  ┌──────────────────────▼─────────────────────────────────────────┐     │
+│  │  Chat Server Instance (one of ~1,000 servers)                  │     │
+│  │                                                                │     │
+│  │  In-memory map: user_id → WebSocket connection                │     │
+│  │  On connect:  register in Session Service (Redis)             │     │
+│  │  On message:                                                   │     │
+│  │    1. Validate (auth, rate limit, content size)               │     │
+│  │    2. Persist to Cassandra (before ACK — durability guarantee)│     │
+│  │    3. ACK to sender (message_id + "sent" status)              │     │
+│  │    4. Lookup recipient's server via Session Service            │     │
+│  │    5a. Recipient ONLINE (same server):                        │     │
+│  │        → deliver via local WebSocket                          │     │
+│  │    5b. Recipient ONLINE (different server):                   │     │
+│  │        → publish to Message Router (Kafka/Redis Pub-Sub)      │     │
+│  │        → recipient's Chat Server delivers via WebSocket       │     │
+│  │    5c. Recipient OFFLINE:                                     │     │
+│  │        → publish to Push Notification Service (Kafka)         │     │
+│  │        → message stored in Cassandra (synced on reconnect)    │     │
+│  │  On disconnect: remove from Session Service, set last_seen    │     │
+│  └────────────────────────────────────────────────────────────────┘     │
+│                                                                         │
+└────────┬──────────────────┬──────────────────┬──────────────────────────┘
+         │                  │                  │
+┌────────▼──────┐   ┌──────▼──────┐    ┌──────▼──────┐
+│ Session       │   │ Message     │    │ Message     │
+│ Service       │   │ Router      │    │ Service     │
+│               │   │             │    │             │
+│ Redis:        │   │ Kafka:      │    │ Persist +   │
+│ session:{uid} │   │  per-server │    │ retrieve    │
+│ = {server_id, │   │  topic or   │    │ messages    │
+│  device_id,   │   │  partition  │    │             │
+│  connected_at}│   │             │    │ Assign      │
+│               │   │ Redis P/S:  │    │ Snowflake   │
+│ presence:{uid}│   │  fast path  │    │ message_id  │
+│ = "online"    │   │  for online │    │             │
+│ TTL: 60s      │   │  delivery   │    │             │
+│ (heartbeat    │   │             │    │             │
+│  refreshes)   │   │             │    │             │
+└───────────────┘   └─────────────┘    └──────┬──────┘
+                                              │
+                                       ┌──────▼──────┐
+                                       │ Cassandra   │
+                                       │ (Messages)  │
+                                       │             │
+                                       │ PK: conv_id │
+                                       │ CK: msg_id  │
+                                       │ (time-      │
+                                       │  ordered)   │
+                                       └─────────────┘
 
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Media Service│    │  Group       │    │  Push Notif  │
-│ (S3 + CDN)  │    │  Service     │    │  Service     │
-└──────────────┘    └──────────────┘    └──────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                   SUPPORTING SERVICES                                  │
+│                                                                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────┐ │
+│  │ Push Notif   │  │ Group        │  │ Media        │  │ E2EE Key  │ │
+│  │ Service      │  │ Service      │  │ Service      │  │ Service   │ │
+│  │              │  │              │  │              │  │           │ │
+│  │ Kafka topic: │  │ Group CRUD,  │  │ 1. Upload    │  │ Public key│ │
+│  │ push-notifs  │  │ membership,  │  │    media via │  │ directory │ │
+│  │              │  │ admin roles  │  │    HTTP → S3 │  │           │ │
+│  │ APNs (iOS)   │  │              │  │ 2. Generate  │  │ X3DH key  │ │
+│  │ FCM (Android)│  │ Msg fan-out: │  │    CDN URL   │  │ exchange  │ │
+│  │              │  │ look up all  │  │ 3. Send URL  │  │ protocol  │ │
+│  │ Rate: batch  │  │ members →    │  │    in msg    │  │           │ │
+│  │ "Alice sent  │  │ route to     │  │    over WS   │  │           │ │
+│  │  you a msg"  │  │ each member's│  │              │  │           │ │
+│  │ (collapse    │  │ chat server  │  │ Thumbnail    │  │           │ │
+│  │  multiple    │  │              │  │ generation   │  │           │ │
+│  │  into one)   │  │ Large groups:│  │ for preview  │  │           │ │
+│  │              │  │ Kafka topic  │  │              │  │           │ │
+│  │              │  │ per group    │  │              │  │           │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └───────────┘ │
+│                                                                        │
+│  Data Stores:                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │
+│  │ MySQL        │  │ S3 + CDN     │  │ Kafka        │                 │
+│  │ (Users,      │  │ (Media       │  │ (messages,   │                 │
+│  │  Groups,     │  │  Storage)    │  │  presence,   │                 │
+│  │  Contacts)   │  │              │  │  push-notifs)│                 │
+│  └──────────────┘  └──────────────┘  └──────────────┘                 │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
@@ -161,6 +226,29 @@
   2. Media Service stores in S3, generates a CDN URL
   3. Client sends a message with the media URL (not the binary) over WebSocket
   4. Recipient fetches media from CDN
+- **Thumbnail generation**: For images/videos, generate a low-res thumbnail (< 10 KB) stored inline in the message — displayed before full media is downloaded
+- **Size limits**: Max file size ~100 MB. For large files, use multipart upload with resumable support
+
+#### Push Notification Service
+- **When triggered**: Chat Server detects recipient is OFFLINE (no session in Redis) → publishes to Kafka topic `push-notifications`
+- **Consumer** picks up the event and sends via:
+  - **APNs** (Apple Push Notification Service) for iOS
+  - **FCM** (Firebase Cloud Messaging) for Android
+  - **Web Push** for browser clients
+- **Notification content**: "Alice sent you a message" (NOT the full message content — for E2EE, server can't read it)
+- **Batching / collapsing**: If multiple messages arrive while user is offline, collapse into "Alice sent you 5 messages" (not 5 separate push notifications)
+- **Badge count**: Update unread badge count via silent push (iOS) or data message (Android)
+- **Rate limiting**: Max 1 push per conversation per 30 seconds to avoid spamming
+
+#### E2EE Key Service
+- **Public key directory**: Each user registers their public key (identity key + signed pre-key + one-time pre-keys) with the server
+- **Key exchange (X3DH)**: When Alice wants to message Bob for the first time:
+  1. Alice fetches Bob's pre-key bundle from Key Service
+  2. Alice performs X3DH to derive a shared secret
+  3. Alice encrypts the first message with this shared secret
+  4. Bob receives the message + Alice's ephemeral public key → derives the same shared secret
+- **Pre-key rotation**: One-time pre-keys are consumed on use. Client periodically uploads new batches (100 pre-keys at a time). If exhausted → fall back to signed pre-key (less forward secrecy)
+- **Double Ratchet**: After initial key exchange, each message derives a new key — so compromise of one key doesn't expose other messages
 
 #### End-to-End Encryption (E2EE)
 - **Signal Protocol** (used by WhatsApp):

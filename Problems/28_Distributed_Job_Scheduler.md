@@ -45,49 +45,163 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────────┐
-│  Clients     │  ← Services submitting jobs via API
-│ (Services)   │
-└──────┬───────┘
-       │
-┌──────▼───────┐
-│ API Gateway  │
-└──────┬───────┘
-       │
-┌──────▼───────────────────────────────────────┐
-│            Job Scheduler Service              │
-│                                               │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │  Job     │  │ Schedule │  │  Job     │   │
-│  │  Store   │  │ Manager  │  │  Dispatch│   │
-│  │  (CRUD)  │  │ (Timer)  │  │  er     │   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
-└───────┼──────────────┼─────────────┼──────────┘
-        │              │             │
-┌───────▼──────┐ ┌─────▼──────┐ ┌───▼──────────┐
-│  PostgreSQL  │ │  Redis     │ │   Kafka      │
-│  (Job Meta,  │ │ (Timer     │ │ (Job Queue)  │
-│   History)   │ │  Bucket,   │ │              │
-│              │ │  Locks)    │ │              │
-└──────────────┘ └────────────┘ └───┬──────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-             ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
-             │  Worker     │ │  Worker     │ │  Worker     │
-             │  Pool 1     │ │  Pool 2     │ │  Pool N     │
-             │ (Executors) │ │ (Executors) │ │ (Executors) │
-             └─────────────┘ └─────────────┘ └─────────────┘
-
-┌──────────────┐
-│  ZooKeeper / │  ← Leader election for schedule managers
-│  etcd        │
-└──────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    CLIENTS (Services / Admin UI)                      │
+│                                                                       │
+│  POST /jobs (one-time)      POST /jobs/recurring (cron)              │
+│  GET /jobs/{id} (status)    DELETE /jobs/{id} (cancel)               │
+└───────────────────────────────┬───────────────────────────────────────┘
+                                │
+                         ┌──────▼──────┐
+                         │ API Gateway │
+                         └──────┬──────┘
+                                │
+┌───────────────────────────────▼───────────────────────────────────────┐
+│                      JOB SCHEDULER SERVICE                            │
+│                                                                       │
+│  ┌─────────────────┐  ┌────────────────────────────────────────────┐  │
+│  │ Job Store       │  │  Schedule Manager (Leader-elected)         │  │
+│  │ (CRUD API)      │  │                                            │  │
+│  │                 │  │  ┌──────────────────────────────────────┐  │  │
+│  │ • Validate job  │  │  │  Timer Bucket Scanner (every 1 sec) │  │  │
+│  │ • Write to PG   │  │  │                                      │  │  │
+│  │ • Insert into   │  │  │  1. Scan current + previous bucket: │  │  │
+│  │   timer bucket  │  │  │     ZRANGEBYSCORE timer:bucket:      │  │  │
+│  │ • Compute next  │  │  │       {minute} 0 {now}              │  │  │
+│  │   bucket for    │  │  │  2. For each due job:                │  │  │
+│  │   cron jobs     │  │  │     ZREM (atomic claim) →            │  │  │
+│  │ • Return job_id │  │  │     if success → dispatch            │  │  │
+│  │                 │  │  │  3. Acquire dispatch lock:            │  │  │
+│  │                 │  │  │     SET job:dispatch:{id} NX EX 60   │  │  │
+│  │                 │  │  │  4. Update PG: status=dispatched     │  │  │
+│  │                 │  │  │  5. Publish to priority Kafka topic  │  │  │
+│  │                 │  │  └──────────────────────────────────────┘  │  │
+│  │                 │  │                                            │  │
+│  │                 │  │  ┌──────────────────────────────────────┐  │  │
+│  │                 │  │  │  Recurring Job Scheduler             │  │  │
+│  │                 │  │  │                                      │  │  │
+│  │                 │  │  │  On job completion:                  │  │  │
+│  │                 │  │  │  1. Parse cron_expression            │  │  │
+│  │                 │  │  │  2. Compute next_execute_at          │  │  │
+│  │                 │  │  │  3. Insert new job into PG           │  │  │
+│  │                 │  │  │  4. ZADD into future timer bucket    │  │  │
+│  │                 │  │  └──────────────────────────────────────┘  │  │
+│  │                 │  │                                            │  │
+│  │                 │  │  ┌──────────────────────────────────────┐  │  │
+│  │                 │  │  │  DAG Dependency Resolver             │  │  │
+│  │                 │  │  │                                      │  │  │
+│  │                 │  │  │  On job completion:                  │  │  │
+│  │                 │  │  │  1. Find dependent jobs              │  │  │
+│  │                 │  │  │  2. DECR deps:{child_job_id}         │  │  │
+│  │                 │  │  │  3. If counter = 0 → all deps met   │  │  │
+│  │                 │  │  │     → dispatch child job             │  │  │
+│  └─────────────────┘  └────────────────────────────────────────────┘  │
+│                                                                       │
+└──────┬──────────────────────┬───────────────────────┬─────────────────┘
+       │                      │                       │
+┌──────▼──────┐        ┌──────▼──────┐         ┌──────▼──────┐
+│ PostgreSQL  │        │   Redis     │         │  ZooKeeper  │
+│             │        │   Cluster   │         │  / etcd     │
+│ • jobs table│        │             │         │             │
+│ • recurring │        │ Timer       │         │ Leader      │
+│   _jobs     │        │ Buckets:    │         │ election    │
+│ • job_      │        │  ZSET per   │         │ for Schedule│
+│   history   │        │  minute     │         │ Manager     │
+│ • job_deps  │        │             │         │             │
+│   (DAG      │        │ Exec Locks: │         │ Partition   │
+│    edges)   │        │  SET NX EX  │         │ assignment  │
+│             │        │             │         │ for multi-  │
+│ Cold store: │        │ Dep Counters│         │ scheduler   │
+│ jobs > 24h  │        │  deps:{id}  │         │             │
+│ away        │        │             │         │             │
+│             │        │ Rate Limits:│         │             │
+│             │        │  rate_limit:│         │             │
+│             │        │  {job_type} │         │             │
+└─────────────┘        └─────────────┘         └─────────────┘
+                              │
+                              │ Hot/Cold migration:
+                              │ Daily job moves tomorrow's
+                              │ jobs from PG → Redis buckets
+                              │
+┌─────────────────────────────▼─────────────────────────────────────────┐
+│                    KAFKA (Priority-Based Dispatch)                     │
+│                                                                       │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────────┐ │
+│  │jobs.critical │ │jobs.high     │ │jobs.normal   │ │jobs.low     │ │
+│  │(priority 1)  │ │(priority 2)  │ │(priority 3)  │ │(priority 4) │ │
+│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬──────┘ │
+│         │                │                │                │        │
+│  Dedicated          Shared pool      Shared pool      Idle-only    │
+│  workers            workers          workers          workers      │
+└─────────┼────────────────┼────────────────┼────────────────┼────────┘
+          │                │                │                │
+┌─────────▼────────────────▼────────────────▼────────────────▼────────┐
+│                      WORKER POOL (Executors)                         │
+│                                                                       │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │  Worker Execution Lifecycle (per job):                         │   │
+│  │                                                                │   │
+│  │  1. Consume job from Kafka                                    │   │
+│  │  2. Acquire execution lock:                                   │   │
+│  │     SET job:exec:{id} {worker_id} NX EX {timeout×2}          │   │
+│  │     → if fail → skip (another worker has it)                  │   │
+│  │  3. Idempotency check: SELECT status FROM jobs WHERE id = ?   │   │
+│  │     → if 'completed' → skip (already done)                    │   │
+│  │  4. UPDATE jobs SET status='running', started_at=NOW()        │   │
+│  │  5. EXECUTE: call target service with job payload             │   │
+│  │  6. On SUCCESS:                                               │   │
+│  │     → UPDATE status='completed', result={...}                 │   │
+│  │     → Release lock: DEL job:exec:{id}                        │   │
+│  │     → If callback_url: POST result to callback                │   │
+│  │     → Trigger: recurring scheduler + dependency resolver      │   │
+│  │  7. On FAILURE:                                               │   │
+│  │     → retries < max_retries?                                  │   │
+│  │       YES → compute next_retry (exponential backoff + jitter) │   │
+│  │            → ZADD retry into future timer bucket              │   │
+│  │            → UPDATE status='retry_pending'                    │   │
+│  │       NO  → UPDATE status='failed'                            │   │
+│  │            → Publish to jobs.dead-letter (DLQ)                │   │
+│  │            → Alert if critical job                            │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│  ┌─────────────────┐   ┌──────────────────────────────────────────┐   │
+│  │ Worker Pool 1   │   │  Dead Letter Queue Consumer             │   │
+│  │ (critical jobs) │   │  • Log failed jobs for investigation    │   │
+│  ├─────────────────┤   │  • Alert on-call if critical            │   │
+│  │ Worker Pool 2   │   │  • Admin can manually retry from DLQ   │   │
+│  │ (normal + high) │   │  • Metrics: DLQ depth, failure reasons  │   │
+│  ├─────────────────┤   └──────────────────────────────────────────┘   │
+│  │ Worker Pool 3   │                                                  │
+│  │ (low priority,  │   ┌──────────────────────────────────────────┐   │
+│  │  idle-only)     │   │  Callback Service (async)                │   │
+│  └─────────────────┘   │  • POST job result to callback_url      │   │
+│                        │  • Retry 3× with exponential backoff    │   │
+│                        │  • If callback fails → log, don't retry │   │
+│                        │    the job itself                        │   │
+│                        └──────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
 
+#### Job Store (CRUD API)
+- Entry point for all job submissions and status queries
+- **On job submission**:
+  1. Validate payload: job_type registered, execute_at in the future, payload matches schema
+  2. Check idempotency: if `idempotency_key` already exists in PG → return existing job
+  3. Write to PostgreSQL: `INSERT INTO jobs (status='scheduled', execute_at=...)`
+  4. Compute timer bucket: `bucket_key = floor(execute_at / 60)`
+  5. Insert into Redis timer bucket: `ZADD timer:bucket:{bucket_key} {exact_timestamp} {job_id}`
+  6. For recurring jobs: also write to `recurring_jobs` table, compute `next_execute_at` from cron
+  7. Return `job_id` to client
+- **On job cancellation**:
+  1. Update PG: `status = 'cancelled'`
+  2. Remove from Redis timer bucket: `ZREM timer:bucket:{bucket_key} {job_id}`
+  3. If job is already `dispatched` or `running` → cancellation is best-effort (worker checks status before execution)
+
 #### Schedule Manager — The Core Scheduling Engine
+
+**Leader Election**: Only ONE schedule manager is active at a time (via ZooKeeper/etcd). Standby instances watch the leader node — if leader dies, a standby is promoted within ~5 seconds.
 
 **The Timer Problem**: How to efficiently trigger millions of jobs at their exact scheduled times?
 
@@ -107,7 +221,7 @@
 
 **Approach 3: Time-Bucket Approach** ⭐ (recommended for massive scale)
 - Divide time into 1-minute buckets
-- Each bucket is a list in Redis: `bucket:{minute_timestamp}` → list of job_ids
+- Each bucket is a sorted set in Redis: `timer:bucket:{minute_timestamp}` → job_ids scored by exact second
 - Schedule Manager processes the current minute's bucket
 - Jobs within the bucket are sorted by exact second
 - **Advantages**: 
@@ -127,39 +241,194 @@ Bucket: 2026-03-13T10:02  → [job_6, job_7, job_8, job_9]
 - O(1) insert and O(1) expiration (amortized)
 - Handles millions of timers with minimal memory
 
-#### Job Dispatcher
-- Receives due jobs from Schedule Manager
-- Publishes job execution request to Kafka (partitioned by job_type or priority)
-- **Priority handling**: Separate Kafka topics per priority
-  - `jobs.critical` → dedicated high-priority worker pool
-  - `jobs.high` → standard pool
-  - `jobs.normal` → standard pool
-  - `jobs.low` → low-priority pool (processed when others are idle)
+#### Timer Bucket Scanner (inside Schedule Manager)
+The core loop that fires due jobs — runs every 1 second on the leader:
+
+```
+while leader:
+    now = current_timestamp()
+    current_bucket = floor(now / 60)
+    prev_bucket = current_bucket - 60  # catch boundary stragglers
+    
+    for bucket in [prev_bucket, current_bucket]:
+        due_jobs = ZRANGEBYSCORE timer:bucket:{bucket} 0 {now} LIMIT 0 100
+        
+        for job_id in due_jobs:
+            # Atomic claim — only ONE scanner gets it
+            claimed = ZREM timer:bucket:{bucket} {job_id}
+            if claimed == 0:
+                continue  # another scanner took it
+            
+            # Belt-and-suspenders dispatch lock
+            locked = SET job:dispatch:{job_id} 1 NX EX 60
+            if not locked:
+                continue  # already dispatched
+            
+            # Update durable state
+            UPDATE jobs SET status='dispatched' WHERE job_id = {job_id}
+            
+            # Dispatch to appropriate priority topic
+            priority = lookup_priority(job_id)
+            kafka.publish(topic=f"jobs.{priority}", payload=job_payload)
+    
+    sleep(1 second)
+```
+
+**Why scan previous bucket too?** A job scheduled at 15:00:59.9 lands in the 15:00 bucket. If the scanner finishes the 15:00 bucket at 15:00:59.5 (before the job is due), it moves to the 15:01 bucket. Without scanning the previous bucket, this job is never fired.
+
+#### Job Dispatcher (Priority-Based Routing)
+- Receives due jobs from the Timer Bucket Scanner
+- Publishes job execution request to Kafka, routing to the correct priority topic
+- **Priority handling**: Separate Kafka topics per priority level
+  - `jobs.critical` → dedicated high-priority worker pool (always has spare capacity)
+  - `jobs.high` → shared pool (processed before normal)
+  - `jobs.normal` → shared pool (default)
+  - `jobs.low` → low-priority pool (only processed when higher-priority topics are empty)
+- **Partition key**: `job_type` or `job_id` — ensures ordering within a job type if needed
 
 #### Worker Pool (Executors)
-- Kafka consumers that execute jobs
-- Each worker:
-  1. Consume job from Kafka
-  2. Set a distributed lock: `SET job:lock:{job_id} {worker_id} NX EX {timeout}`
-  3. Execute the job (call the target service, run the script, etc.)
-  4. Update job status in DB: `completed` or `failed`
-  5. If failed → check retry policy → re-enqueue with backoff
-  6. Release the lock
+Kafka consumer groups that execute jobs. The full worker execution lifecycle:
 
-#### Recurring Job Handling
-- On completion of a recurring job:
-  1. Compute next execution time from cron expression
-  2. Create a new job entry with the next execution time
-  3. Insert into the timer (Redis sorted set or time bucket)
-- **Library**: Parse cron expressions with a library (e.g., `croniter` in Python)
-- **Example**: `"0 */5 * * *"` → every 5 minutes
+1. **Consume** job message from Kafka priority topic
+2. **Acquire execution lock**: `SET job:exec:{job_id} {worker_id} NX EX {timeout×2}`
+   - If lock already held → skip (another worker has it, Kafka rebalance delivered duplicate)
+3. **Idempotency check**: `SELECT status FROM jobs WHERE job_id = ?`
+   - If status is `completed` → skip (already done, lock was stale)
+4. **Update status**: `UPDATE jobs SET status='running', worker_id=?, started_at=NOW()`
+5. **Execute**: Call target service with job payload (HTTP, gRPC, script execution, etc.)
+6. **On success**:
+   - `UPDATE jobs SET status='completed', result=?, completed_at=NOW()`
+   - Release lock: `DEL job:exec:{job_id}`
+   - If `callback_url` configured → hand off to Callback Service
+   - Trigger Recurring Job Scheduler (compute next fire) and DAG Dependency Resolver (unblock children)
+   - Write to `job_history` for audit
+7. **On failure**:
+   - If `retry_count < max_retries` → compute next retry time (exponential backoff + jitter) → `ZADD` into a future timer bucket → `UPDATE status='retry_pending', next_retry_at=?`
+   - If `retry_count >= max_retries` → `UPDATE status='failed'` → publish to `jobs.dead-letter` → alert if job is critical priority
+
+#### Recurring Job Scheduler
+Triggered after a recurring job completes (success or permanent failure):
+
+1. Look up `recurring_jobs` table by `recurring_id`
+2. Parse `cron_expression` with timezone awareness (e.g., `croniter` library)
+   - Handle DST transitions: "daily at 2 AM" — what if 2 AM doesn't exist? (spring forward) → fire at 3 AM
+   - What if 2 AM happens twice? (fall back) → fire on FIRST occurrence only
+3. Compute `next_execute_at`
+4. Insert new job into PostgreSQL: `INSERT INTO jobs (status='scheduled', execute_at=next_execute_at, ...)`
+5. If `next_execute_at` is within 24 hours → `ZADD` into Redis timer bucket (hot path)
+6. If `next_execute_at` is > 24 hours away → stays in PG only (cold path, migrated later)
+7. Update `recurring_jobs`: `last_executed = NOW(), next_execute_at = computed`
+
+**Guard against overlapping executions**: If a recurring job takes longer than its interval (e.g., 5-min job on a 3-min schedule), don't stack up overlaps:
+```
+Before scheduling next: check if previous instance is still 'running'
+If running → skip this occurrence, log warning, alert if consecutive skips > 3
+```
+
+#### DAG Dependency Resolver
+Manages job dependency graphs (Job C depends on Job A and Job B):
+
+```
+Data model (PostgreSQL):
+  CREATE TABLE job_deps (
+      parent_job_id   UUID,
+      child_job_id    UUID,
+      PRIMARY KEY (parent_job_id, child_job_id)
+  );
+
+On job submission with depends_on = [job_A, job_B]:
+  1. Insert edges: (job_A → job_C), (job_B → job_C)
+  2. Set dependency counter in Redis: SET deps:{job_C} 2
+  3. Set job_C status = 'waiting_deps' (not yet in timer bucket)
+
+On job_A completion:
+  1. Query: SELECT child_job_id FROM job_deps WHERE parent_job_id = job_A
+     → finds job_C
+  2. DECR deps:{job_C} → returns 1 (one dep remaining)
+  3. 1 > 0 → not ready yet, do nothing
+
+On job_B completion:
+  1. Query: SELECT child_job_id FROM job_deps WHERE parent_job_id = job_B
+     → finds job_C
+  2. DECR deps:{job_C} → returns 0 (all deps met!)
+  3. 0 = 0 → dispatch job_C:
+     - Update status = 'scheduled'
+     - ZADD into immediate timer bucket (execute_at = NOW)
+     - Job_C will be picked up by Scanner within 1 second
+
+Cycle detection: On submission, run topological sort on the DAG
+  If cycle detected → reject with 400 Bad Request
+  Cycle check: O(V + E) DFS — only at submission time, not on hot path
+```
+
+#### Dead Letter Queue (DLQ) Consumer
+Handles jobs that exhausted all retries:
+
+- Consumes from `jobs.dead-letter` Kafka topic
+- **Actions per failed job**:
+  1. Log full job details (payload, all attempt errors, worker IDs) to `job_history`
+  2. If priority = critical → page on-call engineer immediately (PagerDuty/OpsGenie)
+  3. If priority = high → create incident ticket (Jira/Linear)
+  4. If priority = normal/low → log and increment failure metric
+- **Admin UI integration**: DLQ dashboard shows failed jobs with ability to:
+  - Inspect: view payload, all retry errors, timestamps
+  - Retry: one-click re-enqueue back to the normal pipeline
+  - Discard: acknowledge and remove from DLQ
+- **Metrics**: DLQ depth, DLQ growth rate, top failing job_types, mean time in DLQ
+
+#### Callback Service
+Delivers job results to the submitting service asynchronously:
+
+- Triggered by worker on job completion → publishes callback request to internal Kafka topic
+- Callback worker picks up and sends:
+  ```
+  POST {callback_url}
+  Content-Type: application/json
+  X-Job-Id: job-uuid
+  X-Job-Status: completed
+  
+  { "job_id": "...", "status": "completed", "result": {...}, "completed_at": "..." }
+  ```
+- **Retry policy**: 3 attempts with exponential backoff (1s, 5s, 25s)
+- **If callback fails after retries**: Log failure, do NOT retry or re-execute the job itself. The job execution is complete — callback delivery is best-effort.
+- **Idempotency**: Callback includes `X-Job-Id` header → receiving service can deduplicate
+- **Timeout**: 10 second HTTP timeout per callback attempt
+
+#### Hot/Cold Job Migration
+Manages the split between Redis (hot, fast) and PostgreSQL (cold, durable):
+
+```
+Hot path (Redis): Jobs executing within the next 24 hours
+  - Stored in timer buckets → scanned every second
+  - Fast: O(log N) operations, sub-millisecond
+
+Cold path (PostgreSQL): Jobs scheduled > 24 hours from now
+  - Only stored in the jobs table, NOT in Redis
+  - No timer scanning overhead for far-future jobs
+
+Migration job (runs every hour):
+  SELECT job_id, execute_at FROM jobs
+  WHERE status = 'scheduled'
+    AND execute_at BETWEEN NOW() AND NOW() + INTERVAL '25 hours'
+    AND NOT EXISTS (check if already in Redis)
+  
+  For each: ZADD timer:bucket:{computed_minute} {exact_ts} {job_id}
+  
+  Why 25 hours? 1-hour overlap ensures no job falls through the gap.
+  Idempotent: ZADD with same score+member is a no-op.
+
+Benefit: 100M total jobs but only ~2M in Redis at any time (24-hour window)
+  → Redis memory: 2M × 200 bytes = 400 MB (very manageable)
+  vs 100M in Redis = 20 GB (expensive, wasteful)
+```
 
 #### Exactly-Once Execution
 - **Challenge**: If scheduler crashes after dispatching but before marking job as dispatched, it might dispatch again on recovery
-- **Solution**:
-  1. **Distributed lock**: Before dispatching, acquire lock on job_id (Redis SET NX)
-  2. **Idempotent execution**: Workers check if job already executed (DB status check)
-  3. **Fencing token**: Each dispatch includes a monotonically increasing token. Worker accepts only if token matches expected
+- **Solution — Three Layers of Protection**:
+  1. **Atomic claim (ZREM)**: Only one scanner claims a job from the timer bucket — Redis single-threaded guarantees this
+  2. **Dispatch lock (SET NX)**: Even if ZREM races (near-impossible), the dispatch lock prevents duplicate publishing to Kafka
+  3. **Execution lock + idempotency check**: Worker acquires its own lock AND checks DB status before executing — catches any duplicate that slipped through layers 1 and 2
+- **Fencing token**: Each dispatch includes a monotonically increasing sequence number. Worker accepts only if token ≥ last seen token for that job_id (prevents stale dispatch from a partitioned scheduler)
 
 ---
 
@@ -271,7 +540,7 @@ CREATE TABLE recurring_jobs (
 );
 ```
 
-### PostgreSQL — Job Execution History
+### PostgreSQL — Job Execution History & Dependencies
 
 ```sql
 CREATE TABLE job_history (
@@ -285,9 +554,16 @@ CREATE TABLE job_history (
     error           TEXT,
     attempt_number  INT
 );
+
+CREATE TABLE job_deps (
+    parent_job_id   UUID NOT NULL,
+    child_job_id    UUID NOT NULL,
+    PRIMARY KEY (parent_job_id, child_job_id),
+    INDEX idx_child (child_job_id)
+);
 ```
 
-### Redis — Timer Buckets & Locks
+### Redis — Timer Buckets, Locks & Dependency Counters
 
 ```
 # Time bucket (jobs due in this minute)
@@ -296,7 +572,17 @@ Type:   Sorted Set
 Members: job_id
 Scores:  exact_timestamp_seconds
 
-# Job execution lock
+# Job dispatch lock (scanner → Kafka)
+Key:    job:dispatch:{job_id}
+Value:  1
+TTL:    60 seconds
+
+# Job execution lock (worker holds during execution)
+Key:    job:exec:{job_id}
+Value:  {worker_id}
+TTL:    job_timeout_seconds × 2
+
+# Job execution lock (legacy alias)
 Key:    job:lock:{job_id}
 Value:  {worker_id}
 TTL:    job_timeout_seconds × 2
@@ -304,6 +590,16 @@ TTL:    job_timeout_seconds × 2
 # Recurring job next fire time
 Key:    recurring:next:{recurring_id}
 Value:  next_execute_timestamp
+
+# DAG dependency counter (decremented on each parent completion)
+Key:    deps:{child_job_id}
+Value:  integer (number of remaining parent jobs)
+TTL:    none (deleted when counter reaches 0)
+
+# Rate limit per job type (token bucket)
+Key:    rate_limit:{job_type}
+Value:  integer (remaining tokens)
+TTL:    auto-refills via Lua script
 ```
 
 ### Kafka Topics
@@ -349,17 +645,16 @@ Backoff types:
 ## 8. Additional Considerations
 
 ### Job Dependencies (DAG Execution)
+See **DAG Dependency Resolver** in Component Deep Dive above for full implementation. Summary:
 ```
 Job A ──┬──▶ Job C ──▶ Job E
         │
 Job B ──┘
 
-Implementation:
-- Job C has: depends_on = [Job A, Job B]
-- When Job A completes → check if all dependencies of Job C are complete
-- If yes → schedule Job C for execution
-- Use a "dependency counter" in Redis: DECR deps:{job_C} for each completed dependency
-- When counter reaches 0 → dispatch Job C
+Redis dependency counter: SET deps:{job_C} 2
+On each parent completion: DECR deps:{job_C}
+When counter = 0 → all parents done → dispatch child
+Cycle detection via topological sort at submission time
 ```
 
 ### Rate Limiting Job Execution

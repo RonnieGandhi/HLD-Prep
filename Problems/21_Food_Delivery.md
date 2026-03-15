@@ -44,46 +44,115 @@
 ## 4. High-Level Design (HLD)
 
 ```
-┌──────────┐  ┌──────────┐  ┌──────────┐
-│ Customer │  │Restaurant│  │  Dasher  │
-│   App    │  │  Tablet  │  │   App    │
-└────┬─────┘  └────┬─────┘  └────┬─────┘
-     │              │              │
-┌────▼──────────────▼──────────────▼────┐
-│             API Gateway               │
-└────┬──────────────┬──────────────┬────┘
-     │              │              │
-┌────▼────┐   ┌─────▼─────┐  ┌────▼──────┐
-│Restaurant│  │  Order    │  │  Dasher   │
-│ & Menu  │  │  Service  │  │  Service  │
-│ Service │  │           │  │(Location +│
-└────┬────┘  └─────┬─────┘  │ Matching) │
-     │              │        └────┬──────┘
-┌────▼────┐   ┌─────▼─────┐      │
-│Elastic  │   │   Kafka   │      │
-│Search   │   │(order-    │  ┌───▼──────┐
-│(Search) │   │ events)   │  │ GeoIndex │
-└─────────┘   └─────┬─────┘  │(QuadTree/│
-                     │        │ Redis)   │
-              ┌──────▼──────┐ └──────────┘
-              │ Dispatch /  │
-              │ Assignment  │
-              │ Service     │
-              └──────┬──────┘
-                     │
-         ┌───────────┼───────────┐
-         │           │           │
-   ┌─────▼────┐ ┌───▼────┐ ┌───▼──────┐
-   │ Payment  │ │  ETA   │ │Notif     │
-   │ Service  │ │ Service│ │Service   │
-   └──────────┘ └────────┘ └──────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                            CLIENTS                                     │
+│                                                                        │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐           │
+│  │ Customer App │     │ Restaurant   │     │  Dasher App  │           │
+│  │              │     │ Tablet       │     │              │           │
+│  │ • Browse /   │     │              │     │ • GPS stream │           │
+│  │   search     │     │ • Accept /   │     │   (every 4s) │           │
+│  │ • Place order│     │   reject     │     │ • Accept     │           │
+│  │ • Track      │     │ • Update     │     │   dispatch   │           │
+│  │   dasher     │     │   prep time  │     │ • Navigate   │           │
+│  │ • Rate + tip │     │ • Mark ready │     │ • Confirm    │           │
+│  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘           │
+│         │ REST + WS          │ REST                │ WS (location)    │
+└─────────│────────────────────│─────────────────────│───────────────────┘
+          │                    │                     │
+┌─────────▼────────────────────▼─────────────────────▼───────────────────┐
+│                         API Gateway                                    │
+│  Auth (JWT), rate limiting, geo-routing to nearest DC                 │
+└─────────┬────────────────────┬─────────────────────┬───────────────────┘
+          │                    │                     │
+┌─────────▼───────┐   ┌───────▼───────┐    ┌────────▼────────┐
+│ Restaurant &    │   │ Order Service │    │ Dasher Service  │
+│ Menu Service    │   │ (Saga Orch.)  │    │                 │
+│                 │   │               │    │ • Ingest GPS    │
+│ • Menu CRUD    │   │ States:       │    │ • Update geo    │
+│ • Dynamic      │   │ PLACED →      │    │   index         │
+│   availability │   │ CONFIRMED →   │    │ • Publish to    │
+│ • Search via   │   │ PREPARING →   │    │   Kafka for     │
+│   Elasticsearch│   │ READY →       │    │   tracking      │
+│ • Restaurant   │   │ PICKED_UP →   │    │                 │
+│   rating cache │   │ DELIVERED     │    │ Geospatial      │
+│                │   │               │    │ Index:          │
+│                │   │ Each step →   │    │ Redis GEOADD    │
+│                │   │ Kafka event   │    │ or QuadTree     │
+└────────┬────────┘   │ + compensate │    │ (in-memory)     │
+         │           │ on failure   │    └────────┬────────┘
+    ┌────▼────┐      └───────┬───────┘             │
+    │Elastic  │              │                     │
+    │Search   │              │                     │
+    │(menus,  │     ┌────────▼─────────────────────▼───────────────┐
+    │cuisine, │     │            Kafka (Event Bus)                  │
+    │location)│     │  order-events, dasher-location, dispatch-    │
+    └─────────┘     │  events, tracking-events, payment-events     │
+                    └────────┬──────────┬──────────┬───────────────┘
+                             │          │          │
+                    ┌────────▼────┐ ┌───▼───────┐  │
+                    │ Dispatch /  │ │ Real-Time │  │
+                    │ Assignment  │ │ Tracking  │  │
+                    │ Service     │ │ Service   │  │
+                    │             │ │           │  │
+                    │ • Find      │ │ • Consume │  │
+                    │   nearby    │ │   dasher  │  │
+                    │   dashers   │ │   location│  │
+                    │ • Score:    │ │   from    │  │
+                    │   ETA +     │ │   Kafka   │  │
+                    │   load +    │ │ • Push to │  │
+                    │   rating    │ │   customer│  │
+                    │ • Batch:    │ │   via     │  │
+                    │   same-     │ │   WebSocket│ │
+                    │   restaurant│ │ • Store   │  │
+                    │   orders →  │ │   trail   │  │
+                    │   1 dasher  │ │   in      │  │
+                    │ • Proactive:│ │   Cassandra│ │
+                    │   dispatch  │ │           │  │
+                    │   when      │ └───────────┘  │
+                    │   prep_time │                 │
+                    │   ≈ travel  │                 │
+                    └─────────────┘                 │
+                                                    │
+                    ┌───────────────────────────────▼──────────┐
+                    │         DOWNSTREAM CONSUMERS             │
+                    │                                          │
+                    │  ┌──────────┐ ┌─────────┐ ┌───────────┐ │
+                    │  │ Payment  │ │ ETA     │ │ Notif     │ │
+                    │  │ Service  │ │ Service │ │ Service   │ │
+                    │  │          │ │         │ │           │ │
+                    │  │ Auth on  │ │ ML prep │ │ Push:     │ │
+                    │  │ place →  │ │ time +  │ │ "Order    │ │
+                    │  │ capture  │ │ route   │ │  confirmed│ │
+                    │  │ on       │ │ time +  │ │ ", "Dasher│ │
+                    │  │ delivery │ │ traffic │ │  arriving"│ │
+                    │  │          │ │ buffer  │ │ , receipt │ │
+                    │  │ Split:   │ │         │ │           │ │
+                    │  │ platform │ │         │ │ APNs/FCM  │ │
+                    │  │ + rest.  │ │         │ │ + SMS     │ │
+                    │  │ + dasher │ │         │ │           │ │
+                    │  └──────────┘ └─────────┘ └───────────┘ │
+                    └──────────────────────────────────────────┘
 
-Data Stores:
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│PostgreSQL│ │  Redis   │ │Cassandra │ │  S3      │
-│(Orders,  │ │(Geo, Cart│ │(Tracking,│ │(Menu     │
-│ Payments)│ │ Sessions)│ │ History) │ │ Images)  │
-└──────────┘ └──────────┘ └──────────┘ └──────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                         DATA LAYER                                     │
+│                                                                        │
+│  ┌──────────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │ PostgreSQL   │  │  Redis   │  │Cassandra │  │  S3      │          │
+│  │              │  │          │  │          │  │          │          │
+│  │ • Orders     │  │ • Dasher │  │ • Delivery│ │ • Menu   │          │
+│  │ • Payments   │  │   geo    │  │   location│ │   images │          │
+│  │ • Restaurants│  │   (GEOADD│  │   trail   │ │ • Receipt│          │
+│  │ • Users      │  │   )      │  │   (per    │ │   PDFs   │          │
+│  │ • Addresses  │  │ • Cart   │  │   order,  │ │          │          │
+│  │              │  │ • Session│  │   TTL 30d)│ │          │          │
+│  │ ACID for     │  │ • ETA    │  │          │ │          │          │
+│  │ order state  │  │   cache  │  │ Write-    │ │          │          │
+│  │ transitions  │  │ • Surge  │  │ optimized │ │          │          │
+│  │              │  │   zones  │  │ time-     │ │          │          │
+│  │              │  │          │  │ series    │ │          │          │
+│  └──────────────┘  └──────────┘  └──────────┘  └──────────┘          │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
@@ -162,6 +231,31 @@ Unlike Uber (1 rider → 1 driver), food delivery has a **batching opportunity**
 - **Payment flow**: Authorization on order placement → Capture on delivery confirmation
 - **Split payment**: Customer pays → platform takes commission → restaurant gets food amount → dasher gets delivery fee + tip
 - **Refunds**: For missing items, late delivery, quality issues → automated rules + manual review
+
+#### Dasher Service (Location + Geospatial Index)
+- **GPS ingestion**: Dasher app sends location every 4 seconds via WebSocket → Dasher Service updates the geospatial index
+- **Geospatial index**: Redis `GEOADD dashers:available {lng} {lat} {dasher_id}` for finding nearby dashers → `GEORADIUS` queries during dispatch
+- **Dasher state**: Redis hash `dasher:{id}` → `{status: available|picking_up|delivering, active_orders: [order_ids], lat, lng, last_updated}`
+- **Kafka publishing**: Every location update → Kafka `dasher-location` topic → consumed by Real-Time Tracking Service and Analytics
+- **Dasher availability management**: When dasher goes online/offline, update availability index. When dispatched, set status to `picking_up` → remove from available pool
+
+#### Real-Time Tracking Service
+- **Purpose**: Stream live dasher location to the customer who is waiting for their order
+- **How**: 
+  1. Consume dasher location events from Kafka `dasher-location` topic
+  2. Filter: only forward locations for dashers with active deliveries
+  3. Look up customer WebSocket connection for that order
+  4. Push location update to customer app via WebSocket (every 4 seconds)
+- **Customer UX**: Map shows dasher's live position, estimated time of arrival, and distance
+- **Location trail storage**: Write dasher route to Cassandra `delivery_trail` table (partition key = order_id, clustering key = timestamp) — used for dispute resolution and analytics (TTL 30 days)
+
+#### Notification Service
+- Consumes order events from Kafka and triggers notifications to all parties:
+  - **Customer**: "Order confirmed", "Restaurant is preparing your food", "Dasher is on the way", "Arriving in 2 minutes", "Delivered! Rate your experience"
+  - **Restaurant**: "New order received" (with sound alert on tablet), "Dasher arriving for pickup"
+  - **Dasher**: "New delivery available" (with pickup/dropoff details and earnings estimate)
+- **Channels**: Push notification (APNs/FCM), in-app alerts, SMS (for delivery confirmation to customers who don't have the app open)
+- **Urgency-based**: "New order" to restaurant = high priority (immediate sound alert). "Rate your experience" = low priority (silent push, delayed 30 minutes after delivery)
 
 ---
 

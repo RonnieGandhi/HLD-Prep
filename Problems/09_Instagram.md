@@ -55,43 +55,77 @@
 └──────┬───────┘
        │
 ┌──────▼───────┐
-│    CDN       │  ← Serves images, videos, stories
+│    CDN       │  ← Serves images, videos, stories (edge-cached)
 │ (CloudFront) │
 └──────┬───────┘
        │
 ┌──────▼───────┐
-│ API Gateway  │
+│ API Gateway  │  ← Auth (JWT), rate limiting, geo-routing
 └──────┬───────┘
        │
        ├──────────┬──────────┬──────────┬──────────┬──────────┐
        │          │          │          │          │          │
 ┌──────▼──┐ ┌────▼────┐ ┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌───▼────┐
-│ Post    │ │ Feed    │ │Story  │ │Search │ │Explore│ │Notif   │
+│ Post    │ │ Feed    │ │Story  │ │Search │ │Explore│ │Social  │
 │ Service │ │ Service │ │Service│ │Service│ │Service│ │Service │
-└────┬────┘ └────┬────┘ └───┬───┘ └───┬───┘ └───┬───┘ └────────┘
-     │           │          │         │         │
-     │      ┌────▼────┐     │    ┌────▼───┐  ┌──▼──────┐
-     │      │ Redis   │     │    │Elastic │  │ ML      │
-     │      │(Feed    │     │    │Search  │  │ Ranking │
-     │      │ Cache)  │     │    └────────┘  │ Service │
-     │      └─────────┘     │                └─────────┘
-     │                      │
-┌────▼──────────────────────▼────┐
-│           Kafka                │
-│    (post-events, story-events) │
-└────┬──────────────────────┬────┘
-     │                      │
-┌────▼────┐          ┌──────▼──────┐
-│Fan-Out  │          │ Media       │
-│Service  │          │ Processing  │
-└────┬────┘          │ Pipeline    │
-     │               └──────┬──────┘
-     │                      │
-┌────▼────────────┐  ┌──────▼──────┐
-│  Cassandra /    │  │   S3        │
-│  DynamoDB       │  │ (Object     │
-│  (Posts, Feed)  │  │  Storage)   │
-└─────────────────┘  └─────────────┘
+│         │ │         │ │       │ │       │ │       │ │(Follow,│
+│ Upload  │ │ Hybrid  │ │24h TTL│ │Users, │ │Content│ │ Like,  │
+│ + meta  │ │ fan-out │ │ ephem.│ │ Tags, │ │ reco  │ │ Comment│
+│ + event │ │ + rank  │ │       │ │ Locs  │ │ ML    │ │ Notif) │
+└────┬────┘ └────┬────┘ └───┬───┘ └───┬───┘ └───┬───┘ └───┬────┘
+     │           │          │         │         │         │
+     │      ┌────▼────┐     │    ┌────▼───┐  ┌──▼──────┐ │
+     │      │ Redis   │     │    │Elastic │  │ ML      │ │
+     │      │(Feed    │     │    │Search  │  │ Ranking │ │
+     │      │ Cache   │     │    │(users, │  │ Service │ │
+     │      │ per user│     │    │ tags,  │  │(collab  │ │
+     │      │ ZSET)   │     │    │ places)│  │ filter +│ │
+     │      └─────────┘     │    └────────┘  │ content)│ │
+     │                      │                └─────────┘ │
+     │                      │                            │
+┌────▼──────────────────────▼────────────────────────────▼────┐
+│                          Kafka                               │
+│  (post-events, story-events, like-events, follow-events,    │
+│   comment-events, notification-events)                       │
+└────┬────────────────┬──────────────────┬────────────────┬───┘
+     │                │                  │                │
+┌────▼────┐    ┌──────▼───────┐   ┌──────▼──────┐  ┌─────▼──────┐
+│Fan-Out  │    │ Media        │   │ Notification│  │ Analytics  │
+│Service  │    │ Processing   │   │ Service     │  │ Pipeline   │
+│         │    │ Pipeline     │   │             │  │            │
+│ Normal  │    │              │   │ • Push      │  │ Flink →    │
+│ user:   │    │ • Resize 4   │   │   (APNs/   │  │ ClickHouse │
+│ push to │    │   sizes      │   │   FCM)     │  │            │
+│ follower│    │ • Blurhash   │   │ • "X liked │  │ Engagement │
+│ feeds   │    │ • EXIF strip │   │   your     │  │ metrics,   │
+│         │    │ • Content    │   │   photo"   │  │ creator    │
+│ Celeb:  │    │   moderation │   │ • "X       │  │ analytics  │
+│ skip    │    │   (NSFW ML)  │   │   started  │  │            │
+│ (pull   │    │ • Video:     │   │   following│  │            │
+│  on     │    │   transcode  │   │   you"     │  │            │
+│  read)  │    │   HLS multi- │   │ • Batch:   │  │            │
+│         │    │   bitrate    │   │   "and 42  │  │            │
+│         │    │ • CDN warm   │   │   others"  │  │            │
+└────┬────┘    └──────┬───────┘   └─────────────┘  └────────────┘
+     │                │
+┌────▼────────────────▼──────────────────────────────────────────┐
+│                       DATA LAYER                                │
+│                                                                  │
+│ ┌──────────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐ │
+│ │ Cassandra /  │  │   S3     │  │  Redis   │  │ MySQL        │ │
+│ │ DynamoDB     │  │ (Object  │  │          │  │ (Vitess)     │ │
+│ │              │  │  Storage)│  │ • Feed   │  │              │ │
+│ │ • Posts      │  │          │  │   cache  │  │ • Users      │ │
+│ │ • Feeds      │  │ • Images │  │ • Like   │  │ • Follows    │ │
+│ │ • Stories    │  │   (4 sizes│  │   counts │  │ • Blocks     │ │
+│ │ • Comments   │  │   per    │  │ • Story  │  │ • Auth       │ │
+│ │ • User feed  │  │   image) │  │   tray   │  │ • Settings   │ │
+│ │   timelines  │  │ • Videos │  │ • Session│  │              │ │
+│ │              │  │   (HLS)  │  │ • Explore│  │ Source of    │ │
+│ │ Write-       │  │ • Story  │  │   cache  │  │ truth for    │ │
+│ │ optimized    │  │   media  │  │          │  │ social graph │ │
+│ └──────────────┘  └──────────┘  └──────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
@@ -146,6 +180,32 @@
   - Offline: Spark job computes candidate posts per interest cluster
   - Online: ML ranking model scores candidates for each user
   - Cached in Redis with TTL
+
+#### Social Service (Follow, Like, Comment)
+- **Follow**: Write to MySQL (source of truth for social graph) + update Redis follower sets + publish `follow-event` to Kafka
+- **Like**: Atomic check-and-set in Redis (`SADD liked:{post_id} {user_id}`) + increment counter (`INCR like_count:{post_id}`) + Kafka event for async DB write + notification
+- **Comment**: Write to Cassandra (partition key = post_id, clustering = comment_id for time ordering) + Kafka event → Notification Service
+- **Dedup**: Redis SET for `liked:{post_id}` prevents double-likes; idempotent on retry
+- **Anti-spam**: Rate limit comments (max 20/min per user), ML-based spam classifier on comment text
+
+#### Notification Service
+- Consumes events from Kafka (`like-events`, `follow-events`, `comment-events`, `mention-events`)
+- **Channels**: APNs (iOS push), FCM (Android push), in-app notification feed
+- **Batching**: Multiple likes on the same post → collapse into "Alice and 42 others liked your photo" (not 43 separate pushes)
+- **Notification feed**: Stored in Cassandra (partition key = user_id, ordered by timestamp) — the "Activity" tab
+- **Rate limiting**: Max 1 push per post per 5-minute window for the same event type
+
+#### Search Service (Elasticsearch)
+- **Indexed entities**: Users (username, full name, bio), Hashtags (#sunset → post count, trending score), Locations (place name, coordinates)
+- **Features**: Prefix autocomplete on usernames, fuzzy matching, trending hashtags
+- **Ranking**: For user search — verified badge boost + follower count + mutual followers. For hashtag search — post count + trending velocity
+- **Sync**: User profile changes → Kafka CDC → Elasticsearch consumer updates index
+- **Note**: Post content (captions) are NOT full-text searchable (Instagram design choice — discovery is via hashtags and Explore, not text search)
+
+#### Analytics Pipeline
+- Consumes all Kafka event streams → Flink aggregation → ClickHouse
+- **Metrics**: Post engagement rates, story completion rates, follower growth, creator analytics dashboard
+- **Used by**: Explore ranking model training, content moderation signal enrichment, ad targeting
 
 ---
 

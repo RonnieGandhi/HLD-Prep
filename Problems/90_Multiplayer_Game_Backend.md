@@ -427,3 +427,204 @@ Use TCP for: chat messages, inventory changes, kill feed (reliable events)
 Use UDP for: position updates, state snapshots (real-time, loss-tolerant)
 ```
 
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### The Game Loop — One Tick End-to-End (33ms Budget)
+
+```
+Server tick rate: 30 ticks/sec → 33ms per tick
+20 players in a match, each sending ~3 inputs per tick
+
+Tick 1042 processing:
+
+  T=0ms: RECEIVE phase
+    Read all pending UDP packets from player sockets
+    Buffer: [(player_3, "move_forward, shoot"), (player_7, "jump"), ...]
+    ~60 inputs accumulated (20 players × 3 avg)
+    Late inputs (from tick 1041): process anyway (grace period = 1 tick)
+    Very late inputs (tick 1039): DROP (too old, would break simulation)
+
+  T=2ms: VALIDATE phase
+    For each input:
+      player_3 says "move_forward":
+        Current position: (100, 50). Movement speed: 5 units/tick.
+        New position: (105, 50). Valid? Check:
+          ✓ Distance ≤ max_speed × dt (no speed hack)
+          ✓ No collision with walls (server-side physics check)
+          ✓ Player is alive (dead players can't move)
+        → Accept. Update server state: player_3.pos = (105, 50)
+      
+      player_3 says "shoot":
+        Gun cooldown: last shot was tick 1040 → 2 ticks ago → cooldown = 3 ticks
+        → REJECT (cooldown not expired). Log: potential cheat attempt.
+      
+      player_7 says "jump":
+        Is player_7 on ground? Yes → Accept. Apply physics: vertical velocity.
+
+  T=8ms: SIMULATE phase
+    Run physics simulation for all entities:
+      Projectiles: advance positions, check hit detection
+      Players: apply gravity, resolve collisions
+      Explosions: calculate area damage
+      Power-ups: check pickup proximity
+    
+    Hit detection: player_12's bullet → raycast → hits player_5 at (200, 80)
+      player_5.hp -= 25. If hp <= 0 → kill event.
+
+  T=15ms: SNAPSHOT phase
+    Build game state snapshot for tick 1042:
+      { tick: 1042, players: [{id:3, pos:(105,50), hp:100}, ...],
+        projectiles: [...], events: ["player_5 hit by player_12"] }
+
+  T=18ms: BROADCAST phase
+    For each player, build personalized snapshot:
+      Only include entities within their "area of interest" (anti-wallhack)
+      Compress with delta encoding: only send CHANGES from tick 1041
+        player_3: pos changed (100,50) → (105,50) → send delta (+5, 0)
+        player_8: no change → skip (saves bandwidth)
+    
+    Serialize to protobuf → send UDP packet to each player
+    ~20 packets × ~200 bytes each = 4 KB total outbound
+
+  T=22ms: RECORD phase (async)
+    Append tick 1042 inputs + state to replay buffer (in-memory ring buffer)
+    Every 30 seconds: flush buffer to S3 (compressed)
+
+  T=23ms: IDLE (10ms remaining until tick 1043)
+    Wait or process admin tasks (kick, ban, settings change)
+
+Total: ~23ms of 33ms budget used. 10ms headroom for spikes.
+If a tick exceeds 33ms → game stutters → clients notice immediately.
+```
+
+### Client-Side Prediction + Server Reconciliation
+
+```
+The problem:
+  Player presses "move right" at T=0
+  Input sent to server (50ms network latency)
+  Server processes at T=50ms, broadcasts result at T=55ms
+  Client receives confirmation at T=105ms
+  
+  If client waits for server: 105ms delay between keypress and movement
+  At 30 FPS, that's 3+ frames of input lag → feels sluggish, unplayable
+
+Solution: Client-Side Prediction
+
+  T=0ms:  Player presses "move right"
+          Client IMMEDIATELY applies the input locally (prediction)
+          Player sees character move right → feels instant
+          Client stores: { input_seq: 42, input: "move_right", predicted_pos: (105, 50) }
+          Client sends input to server: { seq: 42, input: "move_right" }
+
+  T=50ms: Server receives input #42, validates, applies
+          Server broadcasts: { tick: X, player_3: { pos: (105, 50), last_processed_input: 42 } }
+
+  T=105ms: Client receives server state
+           Check: server says pos=(105,50), my prediction was (105,50)
+           MATCH! → no correction needed → smooth experience
+
+  When prediction is WRONG (server rejected):
+    Client predicted: pos = (105, 50) — moved right
+    Server says: pos = (100, 50) — movement rejected (hit a wall server-side)
+    
+    Client must reconcile:
+      1. Snap to server position: (100, 50) — abrupt, visually jarring
+      2. OR: interpolate from current rendered position to server position over 100ms
+         (smooth correction — player barely notices)
+    
+    Then: re-apply all inputs the server hasn't processed yet
+      Client has inputs [42, 43, 44] pending
+      Server processed up to 42 → re-simulate 43, 44 on top of server state
+      New predicted position reflects server truth + unprocessed inputs
+
+  This is why server-authoritative + client prediction gives BOTH:
+    Responsiveness (instant feedback from prediction)
+    Security (server validates everything, rejects cheats)
+```
+
+### Entity Interpolation — Making Other Players Move Smoothly
+
+```
+Problem:
+  Server sends position updates at 30 ticks/sec (every 33ms)
+  Client renders at 60 FPS (every 16ms)
+  Between server ticks, what position do we render other players at?
+
+Without interpolation:
+  Tick 100: player_5 at (100, 50)
+  Tick 101: player_5 at (105, 50)
+  
+  Client renders: (100,50) for 33ms → jumps to (105,50) → choppy movement
+
+With interpolation:
+  Client renders BETWEEN two known server states (100ms behind real-time):
+  
+  T=0ms (render):    show player_5 at (100, 50)     — tick 100
+  T=11ms (render):   show player_5 at (101.7, 50)   — 1/3 between tick 100→101
+  T=22ms (render):   show player_5 at (103.3, 50)   — 2/3 between tick 100→101
+  T=33ms (render):   show player_5 at (105, 50)     — tick 101 (exact)
+  
+  Movement is smooth because we're always drawing between TWO known positions
+  Trade-off: other players rendered ~100ms behind real-time (interpolation buffer)
+  For a shooter: 100ms means aiming where player WAS, not where they ARE
+  
+Extrapolation (when next tick hasn't arrived yet):
+  If tick 102 is LATE (packet loss), predict where player will be:
+  Velocity = (105-100) / 33ms → extrapolate: (110, 50)
+  Risk: if player changed direction, extrapolation is wrong → snap correction
+  Extrapolation used only as fallback; interpolation is always preferred
+
+Why render other players 100ms behind?
+  Need TWO data points to interpolate → must buffer one tick
+  Buffer = 2-3 ticks × 33ms = 66-100ms
+  This is invisible to humans (reaction time is 200ms+)
+  But for competitive games: 100ms = difference between hit and miss
+  → Competitive games use tick rates of 64-128 (Valorant: 128-tick = 7.8ms)
+```
+
+### Matchmaking — How Skill-Based Matching Works
+
+```
+ELO / TrueSkill rating system:
+  Each player has: μ (mean skill) and σ (uncertainty)
+  New player: μ=1500, σ=350 (high uncertainty)
+  After 50 games: μ=1720, σ=50 (well-calibrated)
+
+Matching algorithm:
+  1. Player joins queue → placed in Redis sorted set:
+     ZADD mm:queue:us-east {μ} {player_id}
+  
+  2. Matchmaker (runs every 2 seconds):
+     For each player in queue:
+       Find players within μ ± search_radius (start: ±100)
+       If enough found (e.g., 10 for a 5v5) → create match
+       If not → widen search_radius by 50 → retry next cycle
+     
+     search_radius increases with wait time:
+       0-30s: ±100 (tight, fair matches)
+       30-60s: ±200 (wider, acceptable)
+       60-120s: ±400 (any match better than no match)
+       120s+: ±1000 (match anyone available)
+  
+  3. Match creation:
+     Balance teams: assign players to Team A vs Team B
+       Minimize: |avg_μ(Team A) - avg_μ(Team B)|
+       Constraint: max individual μ difference within team < 300
+     
+     Select game server:
+       Choose server in region closest to average player location
+       Allocate via Agones API → get server IP:port
+     
+     Notify players: send match details via WebSocket
+       { server: "gs-42.us-east.game.com:7777", team: "A", match_id: "..." }
+  
+  Why not just sort by rating and pair adjacent?
+    Queue is dynamic: players join/leave constantly
+    Need to consider: region (latency), party groups, role preferences
+    Fairness metric: track post-match win rate per rating bracket
+      If 1500-rated players win 60% against 1500-rated → rating is miscalibrated
+```
+

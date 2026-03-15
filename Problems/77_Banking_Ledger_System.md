@@ -384,3 +384,172 @@ Validation before posting:
   This validation runs BEFORE the PostgreSQL transaction opens.
   Defense in depth: PostgreSQL trigger also validates sum = 0 per transaction_id.
 ```
+
+---
+
+## 9. Deep Dive: Engineering Trade-offs
+
+### Cross-Shard Transfers — When Debit and Credit Are on Different Shards
+
+```
+100M accounts sharded by account_id across 16 PostgreSQL shards.
+Transfer $100 from Account A (Shard 3) to Account B (Shard 11).
+
+Problem: A single PostgreSQL transaction can't span two shards.
+  You need atomicity across two independent databases.
+
+Solution 1: Saga Pattern with Double-Entry Per Shard ⭐
+
+  Instead of two entries (debit A, credit B), create FOUR entries:
+  
+  Shard 3 (Account A's shard):
+    Entry 1: DEBIT  customer:A       $100   (money leaves A)
+    Entry 2: CREDIT suspense:outgoing $100   (tracked as in-flight)
+    → SUM = 0 ✓ (balanced within Shard 3)
+  
+  Shard 11 (Account B's shard):
+    Entry 3: DEBIT  suspense:incoming $100   (received in-flight money)
+    Entry 4: CREDIT customer:B       $100   (money arrives at B)
+    → SUM = 0 ✓ (balanced within Shard 11)
+  
+  Each shard has a self-consistent, balanced transaction.
+  The "suspense" accounts act as intermediate holding.
+  
+  Execution:
+    T1: Write entries 1+2 to Shard 3 (single-shard ACID transaction)
+    T2: Publish event: transfer-debited { transfer_id, from, to, amount }
+    T3: Consumer picks up event → writes entries 3+4 to Shard 11
+    T4: Publish event: transfer-credited { transfer_id }
+    T5: Mark transfer as complete
+  
+  What if T3 fails (Shard 11 is down)?
+    - Entries 1+2 are committed (A already debited)
+    - Suspense:outgoing has $100 (money is "in flight")
+    - Retry T3 with exponential backoff
+    - After 24 hours of retries → alert ops for manual resolution
+    - Suspense account reconciliation catches stuck transfers
+    
+  Compensation (if transfer must be reversed):
+    Shard 3: DEBIT suspense:outgoing $100, CREDIT customer:A $100
+    (Reverse the original entries — never UPDATE or DELETE originals)
+
+Solution 2: Two-Phase Commit (2PC)
+
+  Coordinator → Prepare on Shard 3 + Shard 11 → both OK → Commit both
+  ✓ True atomicity across shards
+  ✗ Holding locks on BOTH shards during prepare phase → latency
+  ✗ If coordinator crashes between prepare and commit → stuck locks
+  ✗ Doesn't scale: at 12K TPS, each transfer locks two shards for ~5 ms
+  
+  Used by: some banks with low transaction volume
+  NOT used by: high-throughput fintech (too slow)
+
+Recommendation: Saga with suspense accounts (Solution 1).
+  Every major payment company (Stripe, Square, PayPal) uses this pattern.
+```
+
+### Idempotent Posting — Preventing Double Charges
+
+```
+Scenario: POST /transfer { from: A, to: B, amount: 100, idempotency_key: "txn-abc" }
+  Network timeout → client retries the same request.
+  Without idempotency: $200 debited instead of $100.
+
+Implementation:
+
+  CREATE TABLE processed_requests (
+    idempotency_key VARCHAR(64) PRIMARY KEY,
+    transaction_id  UUID,
+    result          JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  Posting flow:
+    1. Check: SELECT transaction_id FROM processed_requests 
+              WHERE idempotency_key = 'txn-abc'
+       If found → return cached result (already processed)
+    
+    2. Begin transaction:
+       INSERT INTO processed_requests (idempotency_key, ...) VALUES ('txn-abc', ...)
+         → if UNIQUE violation → concurrent duplicate → return cached result
+       
+       INSERT INTO ledger_entries ... (debit + credit)
+       UPDATE account_balances ...
+       COMMIT
+    
+    3. Return result (also cached in processed_requests)
+
+  The UNIQUE constraint on idempotency_key is the final safety net.
+  Even if application logic has a race condition, the database prevents duplicates.
+
+  Cleanup: processed_requests entries older than 7 days → archive + delete
+  (Clients shouldn't retry after 7 days)
+```
+
+### Race Condition: Concurrent Withdrawals from Same Account
+
+```
+Account A balance: $500
+Two ATM withdrawals simultaneously: $400 each
+
+Without proper locking:
+  Thread 1: SELECT balance FROM accounts WHERE id = A → 500
+  Thread 2: SELECT balance FROM accounts WHERE id = A → 500
+  Thread 1: 500 >= 400 ✓ → UPDATE balance = 100, INSERT DEBIT entry
+  Thread 2: 500 >= 400 ✓ → UPDATE balance = 100, INSERT DEBIT entry
+  Result: Two $400 withdrawals from a $500 account → -$300 balance!
+
+Solution: SELECT ... FOR UPDATE (pessimistic row lock)
+
+  Thread 1: BEGIN
+  Thread 1: SELECT balance FROM accounts WHERE id = A FOR UPDATE → 500 (row LOCKED)
+  Thread 2: BEGIN
+  Thread 2: SELECT balance FROM accounts WHERE id = A FOR UPDATE → BLOCKS (waiting)
+  Thread 1: 500 >= 400 ✓ → UPDATE balance = 100, INSERT DEBIT entry → COMMIT
+  Thread 2: (unblocked) → sees balance = 100 → 100 >= 400 ✗ → ROLLBACK, return "insufficient funds"
+
+  FOR UPDATE ensures serial execution per account row.
+  Only one thread can read+modify the balance at a time.
+
+Additional safety: CHECK constraint
+  ALTER TABLE account_balances ADD CHECK (balance >= 0);
+  Even if application logic fails, database prevents negative balance.
+  (Some accounts CAN go negative: overdraft accounts have CHECK (balance >= -overdraft_limit))
+
+Performance impact:
+  FOR UPDATE on hot accounts (merchant receiving 1000 payments/sec):
+  → All 1000 transactions serialize on one row → throughput collapse
+  
+  Solution: Batch credits
+    Don't credit merchant for every individual payment
+    Aggregate payments in Redis: INCRBYFLOAT pending:{merchant} {amount}
+    Every 5 seconds: flush pending total → single ledger entry
+    → 1000 individual entries → 1 batch entry per 5 seconds → 200× less contention
+```
+
+### Audit Trail: Why Append-Only Is Non-Negotiable
+
+```
+Regulators (OCC, FDIC, PRA) require:
+  1. Every state change to an account is recorded
+  2. Records cannot be modified or deleted
+  3. Trail must show WHO changed WHAT, WHEN, and WHY
+  4. Must be retained for 7+ years
+
+Implementation:
+  ledger_entries table: NO UPDATE, NO DELETE permissions for any role
+    GRANT INSERT ON ledger_entries TO ledger_service;
+    -- No UPDATE or DELETE granted to anyone
+  
+  PostgreSQL row-level security + audit trigger:
+    Any attempt to UPDATE/DELETE → trigger logs the attempt + blocks it
+  
+  "Corrections" are done via reversal entries:
+    Wrong: UPDATE entry SET amount = 95 WHERE id = 42 (FORBIDDEN)
+    Right: INSERT new entry: CREDIT customer $5 (reversal of overcharge)
+           Original entry remains unchanged in the ledger
+  
+  This is exactly how physical accounting ledgers work — you never erase
+  ink from a ledger book, you write a correction entry below it.
+```
+
