@@ -1,5 +1,7 @@
 # 31.2 Design a Distributed Message Broker (Kafka-style)
 
+> **Key distinction from Worker Queue (31_1)**: A message broker / event log **retains messages after consumption** (append-only log), uses **offset-based tracking** (consumer tracks position, not broker), supports **replay** (seek to any offset), and is **pull-based** (consumer controls pace). Worker queues (RabbitMQ/SQS) delete messages after ACK — see `31_1_Distributed_Worker_Queue.md`.
+
 ---
 
 ## 1. Functional Requirements (FR)
@@ -689,9 +691,242 @@ Scenario: Remove Broker 3 from cluster (hardware refresh)
    Broker 3 has no replicas → safe to shut down
 ```
 
+### Race Condition Deep Dives
+
+#### 1. Producer Retry Duplicate — The Idempotent Producer ⭐
+
+```
+Scenario: Producer sends message to leader. Leader writes it. ACK is LOST in network.
+Producer doesn't get ACK → retries → Leader receives AGAIN → writes DUPLICATE.
+
+Without idempotent producer:
+  Offset 42: {order-123, "payment_confirmed"}    ← original
+  Offset 43: {order-123, "payment_confirmed"}    ← DUPLICATE!
+  Consumer processes both → double payment!
+
+With idempotent producer ⭐ (enable.idempotence=true, default since Kafka 3.0):
+  Producer sends: PID=7, Sequence=15, message={order-123, ...}
+  Broker receives: writes to log, ACK lost
+  Producer retries: PID=7, Sequence=15 (same sequence)
+  Broker checks: (PID=7, Partition=0, Sequence=15) already seen → DEDUP → return existing offset
+
+  Implementation:
+    Broker maintains per partition: Map<PID, last_5_sequence_numbers> in memory
+    This map is persisted in .snapshot files alongside segment files
+    If incoming_seq ≤ stored_last_seq → duplicate → discard + return success
+    If incoming_seq > stored_last_seq + 1 → out of order → reject (OutOfOrderSequence)
+    
+  Window: broker tracks last 5 ProducerIDs' sequences per partition
+  PID is assigned by the transaction coordinator (or randomly for non-transactional)
+```
+
+#### 2. Consumer Offset Commit Race — The "At-Least-Once" Gap ⭐
+
+```
+Scenario: Consumer reads message at offset 50, processes it, then commits.
+
+  T=0:   Consumer reads offset 50
+  T=0.1: Consumer processes message (e.g., writes to DB)
+  T=0.2: Consumer CRASHES before commitSync()
+  T=1.0: Consumer restarts, resumes from last committed offset = 49
+  T=1.1: Consumer re-reads offset 50 → processes AGAIN → duplicate DB write!
+
+This is the fundamental at-least-once gap. Every Kafka consumer must handle it.
+
+Solutions:
+  1. Idempotent consumer ⭐ (most common):
+     Consumer writes to DB with idempotency key = (topic, partition, offset)
+     INSERT INTO results (id, data) VALUES ('orders-7-50', ...) ON CONFLICT DO NOTHING
+     Duplicate reprocessing → DB rejects → no side effect
+  
+  2. Exactly-once with Kafka Transactions:
+     Consumer reads → BEGIN TXN → produce to output topic + commit input offset → COMMIT TXN
+     Both succeed atomically or both fail
+     Requires: transactional.id on producer, isolation.level=read_committed on downstream consumer
+  
+  3. Outbox pattern:
+     Consumer writes result + consumed offset to same DB in one DB transaction
+     On restart, read last processed offset from DB (not from __consumer_offsets)
+     Seek to that offset → no duplicates
+
+  4. Auto-commit (enable.auto.commit=true, every 5s):
+     Even WORSE: commit happens on timer, not tied to processing
+     Crash between auto-commit and processing → message SKIPPED (at-most-once!)
+     Crash after processing but before auto-commit → message REPROCESSED
+     → Manual commit is almost always preferred for important data
+```
+
+#### 3. ISR Shrinkage — The Data Loss Window ⭐
+
+```
+Partition with ISR = {Broker1 (leader), Broker2, Broker3}
+Config: acks=all, min.insync.replicas=2, replication.factor=3
+
+T=0:   All healthy. ISR = {B1, B2, B3}. acks=all means all 3 ACK.
+T=10s: Broker3 hits GC pause, falls behind > replica.lag.time.max.ms
+T=10s: Controller removes B3 from ISR. ISR = {B1, B2}
+T=10s: acks=all now means acks={B1, B2} only ← reduced redundancy!
+T=15s: Broker1 (leader) crashes. B2 has all committed data → becomes leader.
+T=15s: B3 is behind → when it recovers, it truncates to High Watermark and re-fetches.
+
+  → No data loss in this scenario (B2 had everything committed).
+
+BUT if min.insync.replicas=1 (dangerous config):
+T=10s: ISR shrinks to {B1, B2}
+T=12s: B2 also falls out of ISR. ISR = {B1} (just the leader!)
+T=12s: acks=all = acks={B1} only = effectively acks=1 ← DANGER
+T=13s: B1 crashes → messages since B2 fell out are LOST (only existed on B1)
+
+Prevention:
+  min.insync.replicas=2 ⭐ → if ISR drops below 2, broker REJECTS writes
+  (NotEnoughReplicasException) → unavailable but NO DATA LOSS
+  
+  Config recommendation for durability:
+    acks=all + min.insync.replicas=2 + replication.factor=3
+    → Tolerates 1 broker failure with zero data loss
+    → 2 failures → writes rejected (unavailable, not lossy)
+```
+
+#### 4. Leader Epoch Fencing — Preventing Split-Brain Writes ⭐
+
+```
+Problem: Old leader doesn't know it's been replaced → accepts stale writes.
+
+Scenario (without fencing):
+  T=0:   B1 is leader for partition 0, epoch=5
+  T=1:   Network partition isolates B1 from controller and followers
+  T=10s: Controller detects B1 is dead → elects B2 as new leader, epoch=6
+  T=11s: B1's network recovers. B1 still thinks it's leader (epoch=5)
+  T=11s: Producer (with stale metadata) sends to B1 → B1 accepts!
+  T=11s: B2 (actual leader) also accepts writes → DIVERGED LOGS!
+
+Solution — Leader Epoch (fencing token):
+  Every leadership change increments the epoch number
+  
+  T=0:   B1 is leader, epoch=5. All writes include epoch=5.
+  T=10s: Controller elects B2, epoch=6.
+  T=11s: B1's network recovers:
+         - Followers fetch from B2 now (epoch=6) → B1 gets no fetch requests
+         - B1 sends metadata request → learns new epoch=6 → steps down
+         - Producer sends to B1 with epoch=5 → B1 checks: my epoch < current → REJECT
+         - Producer gets error → refreshes metadata → discovers B2 is leader → redirects
+
+  Follower truncation on leader change:
+    B1 (old leader) may have messages at offset 5,000,150 that were never committed
+    New leader B2's log ends at 5,000,148
+    B1 becomes follower → fetches from B2 → B2 says "epoch 6 starts at offset 5,000,148"
+    B1 truncates offsets 5,000,149-150 → re-fetches from B2 → logs converge
+
+  This is why unclean.leader.election.enable=false is critical:
+    If enabled → out-of-ISR replica can become leader → LOSES committed messages
+    If disabled → only ISR members become leader → may be unavailable but never lossy
+```
+
+#### 5. Consumer Rebalance — The Stop-the-World Problem
+
+```
+Consumer Group with 3 consumers, 6 partitions. Consumer B crashes.
+
+EAGER rebalance (legacy):
+  T=0:    Consumer B crashes
+  T=0.1s: Coordinator detects missed heartbeat (session.timeout.ms=10s default)
+  T=10s:  Coordinator marks B as dead → triggers rebalance
+  T=10s:  ALL consumers (A and C too!) STOP processing + revoke ALL partitions
+  T=10.5s: A and C re-join group, coordinator reassigns
+  T=11s:  A → {P0,P1,P2}, C → {P3,P4,P5}
+  T=11s:  Consumers resume
+  
+  ⚠️ TOTAL PAUSE: ~11 seconds. ALL partitions stopped.
+  At 500K msgs/sec → 5.5M messages delayed during rebalance
+
+COOPERATIVE incremental rebalance ⭐ (CooperativeStickyAssignor):
+  T=0:    Consumer B crashes
+  T=10s:  Coordinator detects B is dead
+  T=10s:  Coordinator sends: "revoke ONLY B's partitions (P2, P3)"
+  T=10s:  Consumer A keeps processing P0, P1 (NEVER STOPPED!)
+  T=10s:  Consumer C keeps processing P4, P5 (NEVER STOPPED!)
+  T=10.5s: B's partitions reassigned: A → {P0,P1,P2}, C → {P3,P4,P5}
+  
+  ⚠️ Only B's 2 partitions paused for ~0.5 seconds. A and C NEVER stopped.
+
+STATIC GROUP MEMBERSHIP (group.instance.id) ⭐:
+  Consumer B restarts (rolling deploy) with same instance ID
+  → Coordinator recognizes it → assigns SAME partitions → NO rebalance at all
+  → Session timeout extended (session.timeout.ms=300s for static members)
+  → Perfect for Kubernetes rolling deployments
+```
+
+#### 6. Follower Fetch Protocol — How Replication Actually Works
+
+```
+Followers do NOT receive pushes from the leader. They PULL (fetch).
+
+Fetch Loop (on each follower):
+  while (true) {
+    FetchRequest to leader: {partition: 0, fetch_offset: 5000148, max_bytes: 1MB}
+    Leader responds: {messages from offset 5000148..5000200, leader_epoch: 5, HW: 5000145}
+    Follower appends messages to local log
+    Follower advances local High Watermark to min(leader_HW, local_log_end)
+    Repeat immediately (no delay for real-time replication)
+  }
+
+Why pull, not push?
+  1. Follower controls pace → natural backpressure
+  2. Simpler: leader doesn't track each follower's state
+  3. Follower crash → just stops fetching → leader doesn't care
+  4. Follower recovery → starts fetching from last offset → catches up automatically
+
+Replication latency:
+  Network RTT between brokers: ~0.5ms (same DC)
+  Fetch interval: continuous (next fetch immediately after previous completes)
+  Typical replication lag: 1-5ms (sub-millisecond for colocated brokers)
+  ISR threshold: 30 seconds (VERY generous → covers GC pauses, temp issues)
+```
+
 ---
 
 ## 8. Additional Considerations & Deep Dives
+
+### High Watermark (HW) and Log End Offset (LEO) — The Commit Model ⭐
+
+```
+Every partition has TWO key offset markers:
+
+  Log End Offset (LEO): The offset of the NEXT message to be written
+    → Leader's LEO advances on every produce
+    → Follower's LEO advances as it replicates
+
+  High Watermark (HW): The offset up to which ALL ISR replicas have replicated
+    → HW = min(LEO of all ISR members)
+    → Consumers can ONLY read up to HW (committed data only)
+    → Messages between HW and LEO are "uncommitted" — may be lost on failure
+
+  Example:
+    Leader  LEO=150, HW=148
+    Follower A LEO=150
+    Follower B LEO=148  ← slowest ISR member
+    
+    HW = min(150, 150, 148) = 148
+    Consumer sees offsets 0..147 (up to HW-1)
+    Offsets 148, 149 exist on leader but are NOT yet committed
+
+  Why this matters:
+    If leader crashes BEFORE HW advances to 150:
+      New leader (Follower B) only has up to 148
+      Offsets 148-149 are LOST (they were uncommitted)
+      → This is expected and correct behavior with acks=1
+      → With acks=all, producer only gets ACK after HW advances → no surprise loss
+
+  HW propagation:
+    Follower sends FetchRequest with its LEO to leader
+    Leader uses follower LEOs to compute HW
+    Leader sends HW back in FetchResponse
+    Follower updates its local HW = min(leader_HW, own_LEO)
+    
+    This means HW propagation has a ONE-FETCH-ROUND-TRIP delay
+    → Brief window where follower's HW lags leader's HW
+    → Not a problem: consumers read from leader, which has the latest HW
+```
 
 ### Hot Partition Problem
 
@@ -882,3 +1117,248 @@ Broker tuning:
 Golden rule: partitions per broker < 4000 (beyond = high metadata overhead)
 Golden rule: partition count = max(producer_throughput / single_partition_throughput, consumer_count)
 ```
+
+### Partition Count Selection — The #1 Operational Decision
+
+```
+Choosing the right partition count is IRREVERSIBLE (can increase, but NEVER decrease).
+
+Too few partitions (e.g., 1):
+  → Max 1 consumer per group → throughput bottleneck
+  → All data on one broker → hot spot
+  → Single point of failure for that topic
+
+Too many partitions (e.g., 50,000 per topic):
+  → Each partition = open file handles (.log + .index + .timeindex) → FD exhaustion
+  → Each partition leader election takes time → slow recovery on broker crash
+  → More metadata in KRaft → memory pressure on controllers
+  → Consumer rebalance scans all partitions → slow rebalance
+  → More end-to-end latency (more partitions = more replication work)
+
+Sizing formula:
+  partitions = max(
+    target_throughput / throughput_per_partition,
+    max_consumer_count_per_group
+  )
+  
+  Example: 
+    Target: 100 MB/s for topic. Single partition: ~10 MB/s throughput.
+    → 10 partitions minimum for throughput.
+    But we want 20 consumers for processing → need 20 partitions.
+    → Choose 20 partitions.
+
+  Industry defaults: 6-64 partitions per topic
+  LinkedIn (Kafka creators): typically 8-32 partitions per topic
+  Cluster limit: ~200K partitions with ZooKeeper, millions with KRaft
+  Per-broker guideline: < 4,000 partitions (leader + follower combined)
+
+  ⚠️ Increasing partitions: allowed (kafka-topics --alter --partitions 24)
+     BUT: existing keys will remap to different partitions → breaks ordering
+     New partition has no historical data → consumers see incomplete history
+  
+  ⚠️ Decreasing partitions: IMPOSSIBLE. Must recreate topic.
+     → Always start slightly higher than you think you need.
+```
+
+### Schema Registry — Schema Evolution Without Breaking Consumers ⭐
+
+```
+Problem: Producer changes message format → consumer crashes (can't deserialize)
+  V1: {user_id, name, email}
+  V2: {user_id, name, email, phone}    ← New field added
+  V3: {user_id, full_name, email, phone} ← Field renamed (name → full_name)
+
+  Old consumers reading V2/V3 messages → unknown fields → crash or data loss?
+
+Solution: Schema Registry (Confluent or Apicurio)
+
+  Architecture:
+    Producer → serialize with schema (Avro/Protobuf/JSON Schema)
+           → register schema in Schema Registry (HTTP API)
+           → send (schema_id + binary data) to Kafka
+    
+    Consumer → read (schema_id + binary data) from Kafka
+            → fetch schema by ID from Schema Registry (cached)
+            → deserialize with schema → process
+
+  Message on the wire:
+  ┌──────────┬──────────┬────────────────────┐
+  │ Magic (1)│Schema ID │ Avro-encoded data  │
+  │  0x00    │ (4 bytes)│ (no schema overhead)│
+  └──────────┴──────────┴────────────────────┘
+  
+  Schema is stored ONCE in registry, referenced by ID in every message
+  → Massive space savings vs embedding schema in every message (JSON overhead)
+
+Compatibility modes (THE interview question):
+┌───────────────┬──────────────────────────────────────────────────────┐
+│ BACKWARD ⭐   │ New schema can READ data written by old schema       │
+│ (default)     │ Allowed: add field with default, remove field        │
+│               │ Blocked: add required field without default          │
+│               │ Use: most common. Deploy consumers first, then prods │
+├───────────────┼──────────────────────────────────────────────────────┤
+│ FORWARD       │ Old schema can READ data written by new schema       │
+│               │ Allowed: remove field, add optional field            │
+│               │ Blocked: add required field                          │
+│               │ Use: deploy producers first, then consumers          │
+├───────────────┼──────────────────────────────────────────────────────┤
+│ FULL          │ Both backward AND forward compatible                 │
+│               │ Only: add/remove OPTIONAL fields with defaults       │
+│               │ Use: strictest, safest for independent deployments   │
+├───────────────┼──────────────────────────────────────────────────────┤
+│ NONE          │ No compatibility check — anything goes               │
+│               │ Use: development only, never production              │
+└───────────────┴──────────────────────────────────────────────────────┘
+
+Avro vs Protobuf vs JSON Schema:
+  Avro:       Compact binary, schema evolution built-in, Kafka's native choice
+  Protobuf:   Compact binary, strong typing, popular in gRPC ecosystems
+  JSON Schema: Human-readable, larger on wire, easier debugging
+  
+  Recommendation: Avro for Kafka (best ecosystem support), Protobuf if already using gRPC
+```
+
+### Kafka Connect — Scalable Data Integration
+
+```
+Problem: Every team writes custom producers/consumers to move data in/out of Kafka
+  → Duplicated effort, inconsistent error handling, no monitoring
+
+Solution: Kafka Connect — a framework for scalable, fault-tolerant data pipelines
+
+  Source Connectors (external → Kafka):
+    - Debezium (MySQL/Postgres CDC → Kafka) ⭐ most popular
+    - JDBC Source (poll-based database → Kafka)
+    - S3 Source, Kinesis Source, MQ Source
+
+  Sink Connectors (Kafka → external):
+    - Elasticsearch Sink (search indexing)
+    - S3 Sink (data lake / archival)
+    - HDFS Sink (Hadoop)
+    - JDBC Sink (database)
+    - BigQuery / Snowflake Sink
+
+  Architecture:
+    ┌─────────────────────────────────────────────────────┐
+    │  Kafka Connect Cluster (3+ worker nodes)             │
+    │                                                      │
+    │  Worker 1: [Debezium-MySQL task 0] [S3-Sink task 0] │
+    │  Worker 2: [Debezium-MySQL task 1] [ES-Sink task 0] │
+    │  Worker 3: [Debezium-MySQL task 2] [ES-Sink task 1] │
+    │                                                      │
+    │  Connector config stored in: connect-configs topic   │
+    │  Connector offsets stored in: connect-offsets topic   │
+    │  Connector status stored in: connect-status topic     │
+    └─────────────────────────────────────────────────────┘
+
+  Key properties:
+    - Distributed mode: tasks balanced across workers, auto-rebalance on failure
+    - Exactly-once (Kafka 3.3+): source connectors can use transactions
+    - Schema integration: auto-registers schemas in Schema Registry
+    - Transforms (SMTs): lightweight message transforms (rename fields, route, filter)
+    - Dead letter queue: failed records sent to DLQ topic (not block pipeline)
+
+  Why not just write a consumer?
+    Connect handles: offset management, parallelism, fault tolerance, monitoring,
+    schema evolution, exactly-once — all out of the box. Writing a robust CDC
+    consumer from scratch takes months. Debezium connector takes 10 minutes to configure.
+```
+
+### Kafka Streams vs. Flink — Stream Processing Comparison
+
+```
+Problem: Data in Kafka needs real-time transformation, aggregation, joins
+
+Kafka Streams (library, runs in your JVM):
+  ✓ No separate cluster needed — just a Java library in your app
+  ✓ Exactly-once semantics (built on Kafka transactions)
+  ✓ State stores (RocksDB-backed, changelog topic for recovery)
+  ✓ Simple deployment (just deploy your app)
+  ✗ JVM only
+  ✗ Scaling = more app instances (each gets partitions)
+  ✗ Limited windowing compared to Flink
+
+  Example:
+    StreamsBuilder builder = new StreamsBuilder();
+    builder.stream("orders")
+           .filter((k, v) -> v.amount > 100)
+           .groupByKey()
+           .windowedBy(TimeWindows.of(Duration.ofMinutes(5)))
+           .count()
+           .toStream()
+           .to("high-value-order-counts");
+
+Flink (separate cluster):
+  ✓ Rich windowing, complex event processing
+  ✓ Multi-language (Java, Scala, Python, SQL)
+  ✓ Handles out-of-order events (watermarks)
+  ✓ Can read from Kafka AND other sources
+  ✗ Separate cluster to deploy and manage
+  ✗ More complex operations
+  ✗ Checkpointing overhead
+
+  Choose Kafka Streams when: simple transforms, Kafka-to-Kafka, small team
+  Choose Flink when: complex analytics, multi-source, large-scale aggregation
+```
+
+### Event Log vs Worker Queue: The Fundamental Design Choice
+
+```
+┌──────────────────────┬───────────────────────┬────────────────────────┐
+│                      │ Event Log (Kafka) ⭐   │ Worker Queue           │
+│                      │                        │ (RabbitMQ/SQS)         │
+├──────────────────────┼───────────────────────┼────────────────────────┤
+│ Mental model         │ Immutable event ledger │ Task inbox             │
+│ Message after ACK    │ RETAINED ⭐            │ DELETED                │
+│ Consumer state       │ Consumer tracks offset │ Broker tracks per-msg  │
+│ Delivery model       │ Pull (consumer polls)  │ Push (broker → worker) │
+│ Routing              │ Partition key only     │ Rich (exchanges) ⭐     │
+│ Replay               │ Seek to any offset ⭐  │ Not possible           │
+│ Ordering             │ Per-partition FIFO     │ Per-queue FIFO         │
+│ Consumer parallelism │ Limited by partitions  │ Add workers freely ⭐   │
+│ Storage growth       │ Unbounded (retention)  │ Bounded (transient)    │
+│ Backpressure         │ Natural (pull-based) ⭐ │ Credit-based (push)    │
+│ Multi-consumer       │ Consumer groups (free) │ Fanout exchange (copy) │
+│ Use case             │ Event sourcing, CDC,   │ Job processing, RPC,   │
+│                      │ analytics, streaming   │ task queues             │
+│ Analogy              │ Git commit log         │ Email inbox            │
+└──────────────────────┴───────────────────────┴────────────────────────┘
+
+When interviewer says "Design a Message Broker / Event Streaming":
+  → Think Kafka: append-only log, partitions, offsets, ISR, consumer groups, replay
+  
+When interviewer says "Design a Worker Queue / Task Queue":
+  → Think RabbitMQ/SQS: delete on ACK, visibility timeout, exchanges, DLQ, priority
+  → See 31_1_Distributed_Worker_Queue.md
+```
+
+### Message Delivery Semantics — Complete Framework
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Delivery Guarantee Matrix                        │
+├─────────────────┬────────────────┬────────────────┬────────────────────┤
+│                 │ At-Most-Once   │ At-Least-Once  │ Exactly-Once       │
+├─────────────────┼────────────────┼────────────────┼────────────────────┤
+│ Producer        │ acks=0         │ acks=all       │ acks=all           │
+│                 │ no retry       │ retries=MAX    │ enable.idempotence │
+│                 │                │                │ transactional.id   │
+├─────────────────┼────────────────┼────────────────┼────────────────────┤
+│ Consumer        │ commit BEFORE  │ commit AFTER   │ read_committed +   │
+│                 │ processing     │ processing     │ transactional      │
+│                 │                │                │ offset commit      │
+├─────────────────┼────────────────┼────────────────┼────────────────────┤
+│ Data Loss?      │ YES            │ NO             │ NO                 │
+│ Duplicates?     │ NO             │ YES            │ NO                 │
+│ Use Case        │ Metrics, logs  │ Most workloads │ Financial, orders  │
+│ Perf impact     │ Fastest        │ Fast           │ ~10-20% slower     │
+└─────────────────┴────────────────┴────────────────┴────────────────────┘
+
+Exactly-once end-to-end requires ALL THREE:
+  1. Idempotent producer (PID + sequence → broker dedup)
+  2. Transactional produce (atomic multi-partition writes)
+  3. Consumer with read_committed (skip uncommitted/aborted messages)
+
+Most teams choose at-least-once + idempotent consumer (simpler, nearly as safe)
+```
+
