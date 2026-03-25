@@ -1,12 +1,12 @@
-# HLD Prep — 102 System Design Problems
+# HLD Prep — 103 System Design Problems
 
 > **For senior / staff engineers** who already know the fundamentals but need to sharpen depth, nail tricky trade-offs, and plug gaps that cost rounds.
 
 The 102 problems are split into **three progressive batches**:
 
 | Batch | Problems | Goal |
-|-------|----------|------|
-| **🔴 Batch 1 — Must Do** | 30 | High ROI. Covers the widest spread of categories, each one chosen because it teaches a **non-obvious depth concept** that senior/staff interviews specifically probe. Completing just this batch gives you strong coverage across all major domains. |
+|-------|----|------|
+| **🔴 Batch 1 — Must Do** | 31 | High ROI. Covers the widest spread of categories, each one chosen because it teaches a **non-obvious depth concept** that senior/staff interviews specifically probe. Completing just this batch gives you strong coverage across all major domains. |
 | **🟡 Batch 2 — Expand** | 32 | Broadens your arsenal. Fills remaining categories, introduces niche domains (fintech, ad-tech, ML systems, CDC, workflow orchestration), and adds problems where the **differentiator is a specific technique** (CRDT, circuit breaker, consensus, durable execution). |
 | **🟢 Batch 3 — Good to Have** | 40 | Lower marginal ROI. Either simpler problems you can reason through in an interview without deep prep, or very specialized systems. Study if time permits — these won't be your weak link. |
 
@@ -14,7 +14,7 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 
 ---
 
-## 🔴 Batch 1 — Must Do (30 Problems)
+## 🔴 Batch 1 — Must Do (31 Problems)
 
 *Goal: maximum topic coverage × maximum depth per problem. Every one of these has a concept that regularly trips up senior candidates.*
 
@@ -24,32 +24,33 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 | 2 | [API Rate Limiter](Problems/02_API_Rate_Limiter.md) | Infrastructure | ⭐⭐⭐ Medium | Token bucket vs sliding window log vs sliding window counter, distributed rate limiting with Redis + Lua, race conditions in `GET-then-SET`, rate limiting at API gateway vs application layer |
 | 3 | [Distributed Cache (Redis)](Problems/27_Distributed_Cache.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Consistent hashing with virtual nodes, eviction policies (LRU/LFU internals), cache stampede / thundering herd, write-through vs write-behind vs write-around, hot key mitigation |
 | 4 | [Distributed Worker Queue (RabbitMQ / SQS)](Problems/31_1_Distributed_Worker_Queue.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Partitioning & consumer groups, exactly-once semantics, ISR replication, offset management, dead-letter queues, backpressure — **foundational** for half the other problems |
-| 5 | [News Feed System](Problems/06_News_Feed_System.md) | Feed & Social | ⭐⭐⭐⭐ Hard | Fan-out on write vs read vs **hybrid**, celebrity problem, feed ranking with ML, precomputed timelines in Redis, sharding social graph |
-| 6 | [Real-Time Chat (WhatsApp)](Problems/07_Real_Time_Chat.md) | Messaging | ⭐⭐⭐⭐ Hard | WebSocket connection management at scale, message ordering guarantees, read receipts, group chat fan-out, offline message queue, end-to-end encryption architecture |
-| 7 | [Notification System](Problems/05_Notification_System.md) | Infrastructure | ⭐⭐⭐ Medium | Multi-channel delivery (push/SMS/email), priority queues, deduplication, rate limiting per user, template rendering, delivery guarantees vs best-effort |
-| 8 | [Unique ID Generator](Problems/04_Unique_ID_Generator.md) | Infrastructure | ⭐⭐⭐ Medium | Snowflake ID, UUID trade-offs, clock skew handling, database ticket servers, k-sortable IDs — tiny problem but the **depth of clock reasoning** catches people |
-| 9 | [Key-Value Store](Problems/03_Key_Value_Store.md) | Storage | ⭐⭐⭐⭐ Hard | LSM trees vs B-trees, WAL, compaction strategies, consistent hashing, vector clocks for conflict resolution, tunable consistency (quorum reads/writes) |
-| 10 | [Search Engine](Problems/12_Search_Engine.md) | Search | ⭐⭐⭐⭐⭐ Very Hard | Inverted index construction, TF-IDF / BM25 scoring, index sharding & replication, query parsing & spell correction, ranking pipeline (retrieval → re-ranking), snippet generation |
-| 11 | [Typeahead / Autocomplete](Problems/11_Typeahead_Autocomplete.md) | Search | ⭐⭐⭐ Medium | Trie with frequency, precomputed top-K per prefix, data collection pipeline, sampling for scale, prefix-based sharding, Zookeeper for trie updates |
-| 12 | [Web Crawler](Problems/13_Web_Crawler.md) | Data Infra | ⭐⭐⭐⭐ Hard | BFS with politeness, URL frontier design, robots.txt, duplicate detection (simhash/minhash), DNS resolution caching, distributed coordination |
-| 13 | [Ride Hailing (Uber)](Problems/19_Ride_Hailing_Uber.md) | Location & Matching | ⭐⭐⭐⭐⭐ Very Hard | Geospatial indexing (S2/H3 cells), real-time supply/demand matching, dispatch algorithm, ETA prediction, surge pricing trigger, trip state machine |
-| 14 | [Distributed Job Scheduler](Problems/28_Distributed_Job_Scheduler.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Exactly-once execution, task deduplication, priority scheduling, cron expression parsing, fault-tolerant task pickup with distributed locks, job DAGs |
-| 15 | [Payment Gateway](Problems/24_Payment_Gateway.md) | Fintech | ⭐⭐⭐⭐ Hard | Idempotency keys, two-phase payment (authorize → capture), PSP integration, reconciliation, ledger design, PCI compliance, handling partial failures |
-| 16 | [Video Streaming Platform (YouTube)](Problems/15_Video_Streaming_Platform.md) | Media | ⭐⭐⭐⭐ Hard | Adaptive bitrate streaming (HLS/DASH), video transcoding pipeline, CDN edge caching, pre-signed URLs, chunked upload with resume, view count aggregation |
-| 17 | [CDN](Problems/17_CDN.md) | Infrastructure | ⭐⭐⭐⭐ Hard | PoP architecture, cache hierarchies (edge → shield → origin), cache invalidation strategies, consistent hashing for origin shielding, TLS termination, geo-routing |
-| 18 | [Dropbox / Google Drive](Problems/25_Dropbox_Google_Drive.md) | Storage | ⭐⭐⭐⭐⭐ Very Hard | File chunking & deduplication, delta sync (rsync), conflict resolution, block-level storage, metadata DB design, notification of changes across devices |
-| 19 | [Distributed Tracing (Jaeger)](Problems/32_Distributed_Tracing.md) | Observability | ⭐⭐⭐⭐ Hard | Span propagation (context injection), sampling strategies (head vs tail), trace assembly from distributed spans, storage in columnar DBs, trace ID correlation |
-| 20 | [Log Aggregation & Search (ELK)](Problems/40_Log_Aggregation_Search.md) | Observability | ⭐⭐⭐⭐ Hard | Agent → collector → indexer pipeline, structured logging, index rotation & retention, full-text search at scale, hot-warm-cold tiering, log-based alerting |
-| 21 | [Event Sourcing System](Problems/33_Event_Sourcing_System.md) | Architecture | ⭐⭐⭐⭐ Hard | Event log as source of truth, CQRS pattern, projections/materialized views, snapshot optimization, saga pattern for distributed transactions, temporal queries |
-| 22 | [Ecommerce Platform](Problems/22_Ecommerce_Platform.md) | Commerce | ⭐⭐⭐⭐⭐ Very Hard | Catalog service, cart ↔ inventory reservation, order state machine, search with faceted filtering, payment orchestration, seller/buyer split architecture |
-| 23 | [Ticketing System (BookMyShow)](Problems/23_Ticketing_System.md) | Commerce | ⭐⭐⭐⭐ Hard | Seat locking with TTL, distributed transactions for booking, double-booking prevention, pessimistic vs optimistic locking, waiting queue fairness |
-| 24 | [Distributed Lock Manager](Problems/29_Distributed_Lock_Manager.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Redlock algorithm, fencing tokens, lease-based locks, ZooKeeper vs etcd for coordination, lock contention & fairness, clock drift issues |
-| 25 | [Google Docs (Collaborative Editing)](Problems/81_Google_Docs_Collaborative_Editing.md) | Real-time Collab | ⭐⭐⭐⭐⭐ Very Hard | OT (Operational Transformation) vs CRDT, cursor position sync, version vectors, WebSocket session management, conflict-free merges, undo/redo in collaborative context |
-| 26 | [Fraud Detection System](Problems/74_Fraud_Detection_System.md) | ML / Security | ⭐⭐⭐⭐ Hard | Real-time feature computation, rule engine + ML model ensemble, graph-based fraud rings, false positive management, model retraining pipeline, PII handling |
-| 27 | [Stock Exchange Matching Engine](Problems/76_Stock_Exchange_Matching_Engine.md) | Fintech | ⭐⭐⭐⭐⭐ Very Hard | Order book data structure (price-time priority), matching algorithm, lock-free queues, nanosecond latency, market data dissemination, regulatory audit trail |
-| 28 | [Recommendation System](Problems/47_Recommendation_System.md) | ML Systems | ⭐⭐⭐⭐ Hard | Two-tower model, candidate generation (ANN search), ranking stage, feature store, cold start, exploration vs exploitation, A/B testing integration |
-| 29 | [Distributed Consensus (Raft/Paxos)](Problems/83_Distributed_Consensus_Raft_Paxos.md) | Infrastructure | ⭐⭐⭐⭐⭐ Very Hard | Leader election, log replication, safety guarantees, membership changes, split-brain prevention — **the theoretical backbone** interviewers expect staff engineers to articulate |
-| 30 | [Load Balancer](Problems/30_Load_Balancer.md) | Infrastructure | ⭐⭐⭐ Medium | L4 vs L7, consistent hashing, health checks, connection draining, sticky sessions, global server load balancing (GSLB), direct server return |
+| 5 | [Distributed Message Broker (Kafka)](Problems/31_2_Distributed_Message_Broker.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Append-only log, offset-based consumer tracking, consumer groups, message replay, pull-based consumption, log compaction, schema evolution — **contrast with Worker Queue (31_1)** |
+| 6 | [News Feed System](Problems/06_News_Feed_System.md) | Feed & Social | ⭐⭐⭐⭐ Hard | Fan-out on write vs read vs **hybrid**, celebrity problem, feed ranking with ML, precomputed timelines in Redis, sharding social graph |
+| 7 | [Real-Time Chat (WhatsApp)](Problems/07_Real_Time_Chat.md) | Messaging | ⭐⭐⭐⭐ Hard | WebSocket connection management at scale, message ordering guarantees, read receipts, group chat fan-out, offline message queue, end-to-end encryption architecture |
+| 8 | [Notification System](Problems/05_Notification_System.md) | Infrastructure | ⭐⭐⭐ Medium | Multi-channel delivery (push/SMS/email), priority queues, deduplication, rate limiting per user, template rendering, delivery guarantees vs best-effort |
+| 9 | [Unique ID Generator](Problems/04_Unique_ID_Generator.md) | Infrastructure | ⭐⭐⭐ Medium | Snowflake ID, UUID trade-offs, clock skew handling, database ticket servers, k-sortable IDs — tiny problem but the **depth of clock reasoning** catches people |
+| 10 | [Key-Value Store](Problems/03_Key_Value_Store.md) | Storage | ⭐⭐⭐⭐ Hard | LSM trees vs B-trees, WAL, compaction strategies, consistent hashing, vector clocks for conflict resolution, tunable consistency (quorum reads/writes) |
+| 11 | [Search Engine](Problems/12_Search_Engine.md) | Search | ⭐⭐⭐⭐⭐ Very Hard | Inverted index construction, TF-IDF / BM25 scoring, index sharding & replication, query parsing & spell correction, ranking pipeline (retrieval → re-ranking), snippet generation |
+| 12 | [Typeahead / Autocomplete](Problems/11_Typeahead_Autocomplete.md) | Search | ⭐⭐⭐ Medium | Trie with frequency, precomputed top-K per prefix, data collection pipeline, sampling for scale, prefix-based sharding, Zookeeper for trie updates |
+| 13 | [Web Crawler](Problems/13_Web_Crawler.md) | Data Infra | ⭐⭐⭐⭐ Hard | BFS with politeness, URL frontier design, robots.txt, duplicate detection (simhash/minhash), DNS resolution caching, distributed coordination |
+| 14 | [Ride Hailing (Uber)](Problems/19_Ride_Hailing_Uber.md) | Location & Matching | ⭐⭐⭐⭐⭐ Very Hard | Geospatial indexing (S2/H3 cells), real-time supply/demand matching, dispatch algorithm, ETA prediction, surge pricing trigger, trip state machine |
+| 15 | [Distributed Job Scheduler](Problems/28_Distributed_Job_Scheduler.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Exactly-once execution, task deduplication, priority scheduling, cron expression parsing, fault-tolerant task pickup with distributed locks, job DAGs |
+| 16 | [Payment Gateway](Problems/24_Payment_Gateway.md) | Fintech | ⭐⭐⭐⭐ Hard | Idempotency keys, two-phase payment (authorize → capture), PSP integration, reconciliation, ledger design, PCI compliance, handling partial failures |
+| 17 | [Video Streaming Platform (YouTube)](Problems/15_Video_Streaming_Platform.md) | Media | ⭐⭐⭐⭐ Hard | Adaptive bitrate streaming (HLS/DASH), video transcoding pipeline, CDN edge caching, pre-signed URLs, chunked upload with resume, view count aggregation |
+| 18 | [CDN](Problems/17_CDN.md) | Infrastructure | ⭐⭐⭐⭐ Hard | PoP architecture, cache hierarchies (edge → shield → origin), cache invalidation strategies, consistent hashing for origin shielding, TLS termination, geo-routing |
+| 19 | [Dropbox / Google Drive](Problems/25_Dropbox_Google_Drive.md) | Storage | ⭐⭐⭐⭐⭐ Very Hard | File chunking & deduplication, delta sync (rsync), conflict resolution, block-level storage, metadata DB design, notification of changes across devices |
+| 20 | [Distributed Tracing (Jaeger)](Problems/32_Distributed_Tracing.md) | Observability | ⭐⭐⭐⭐ Hard | Span propagation (context injection), sampling strategies (head vs tail), trace assembly from distributed spans, storage in columnar DBs, trace ID correlation |
+| 21 | [Log Aggregation & Search (ELK)](Problems/40_Log_Aggregation_Search.md) | Observability | ⭐⭐⭐⭐ Hard | Agent → collector → indexer pipeline, structured logging, index rotation & retention, full-text search at scale, hot-warm-cold tiering, log-based alerting |
+| 22 | [Event Sourcing System](Problems/33_Event_Sourcing_System.md) | Architecture | ⭐⭐⭐⭐ Hard | Event log as source of truth, CQRS pattern, projections/materialized views, snapshot optimization, saga pattern for distributed transactions, temporal queries |
+| 23 | [Ecommerce Platform](Problems/22_Ecommerce_Platform.md) | Commerce | ⭐⭐⭐⭐⭐ Very Hard | Catalog service, cart ↔ inventory reservation, order state machine, search with faceted filtering, payment orchestration, seller/buyer split architecture |
+| 24 | [Ticketing System (BookMyShow)](Problems/23_Ticketing_System.md) | Commerce | ⭐⭐⭐⭐ Hard | Seat locking with TTL, distributed transactions for booking, double-booking prevention, pessimistic vs optimistic locking, waiting queue fairness |
+| 25 | [Distributed Lock Manager](Problems/29_Distributed_Lock_Manager.md) | Infrastructure | ⭐⭐⭐⭐ Hard | Redlock algorithm, fencing tokens, lease-based locks, ZooKeeper vs etcd for coordination, lock contention & fairness, clock drift issues |
+| 26 | [Google Docs (Collaborative Editing)](Problems/81_Google_Docs_Collaborative_Editing.md) | Real-time Collab | ⭐⭐⭐⭐⭐ Very Hard | OT (Operational Transformation) vs CRDT, cursor position sync, version vectors, WebSocket session management, conflict-free merges, undo/redo in collaborative context |
+| 27 | [Fraud Detection System](Problems/74_Fraud_Detection_System.md) | ML / Security | ⭐⭐⭐⭐ Hard | Real-time feature computation, rule engine + ML model ensemble, graph-based fraud rings, false positive management, model retraining pipeline, PII handling |
+| 28 | [Stock Exchange Matching Engine](Problems/76_Stock_Exchange_Matching_Engine.md) | Fintech | ⭐⭐⭐⭐⭐ Very Hard | Order book data structure (price-time priority), matching algorithm, lock-free queues, nanosecond latency, market data dissemination, regulatory audit trail |
+| 29 | [Recommendation System](Problems/47_Recommendation_System.md) | ML Systems | ⭐⭐⭐⭐ Hard | Two-tower model, candidate generation (ANN search), ranking stage, feature store, cold start, exploration vs exploitation, A/B testing integration |
+| 30 | [Distributed Consensus (Raft/Paxos)](Problems/83_Distributed_Consensus_Raft_Paxos.md) | Infrastructure | ⭐⭐⭐⭐⭐ Very Hard | Leader election, log replication, safety guarantees, membership changes, split-brain prevention — **the theoretical backbone** interviewers expect staff engineers to articulate |
+| 31 | [Load Balancer](Problems/30_Load_Balancer.md) | Infrastructure | ⭐⭐⭐ Medium | L4 vs L7, consistent hashing, health checks, connection draining, sticky sessions, global server load balancing (GSLB), direct server return |
 
 **After Batch 1 you'll have covered:** caching, queues, feeds, chat, search, geo, payments, storage, streaming, observability, event sourcing, consensus, collaborative editing, ML systems, fintech, and core infra patterns.
 
@@ -194,4 +195,4 @@ Within each batch, problems are ordered so that **earlier ones build foundations
 | ⭐⭐⭐ Medium | 36 | 35% |
 | ⭐⭐⭐⭐ Hard | 49 | 48% |
 | ⭐⭐⭐⭐⭐ Very Hard | 16 | 16% |
-| **Total** | **102** | |
+| **Total** | **103** | |
