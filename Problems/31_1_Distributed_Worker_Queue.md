@@ -1,19 +1,24 @@
-# 31. Design a Distributed Queue (like RabbitMQ / SQS)
+# 31. Design a Distributed Worker Queue (like RabbitMQ / SQS)
+
+> **Key distinction from Kafka/Message Broker (31_2)**: A worker queue **deletes messages after ACK**, has **no offsets/replay**, supports **push-based delivery**, **per-message routing**, **visibility timeouts**, and **priority queues**. Kafka is an append-only log; this is a traditional message queue.
 
 ---
 
 ## 1. Functional Requirements (FR)
 
-- **Produce messages**: Publishers send messages to named queues/topics
-- **Consume messages**: Consumers pull or receive pushed messages from queues
-- **At-least-once delivery**: Every message delivered at least once (duplicates possible, not losses)
-- **Ordering**: FIFO ordering within a partition/queue
-- **Acknowledgment**: Consumers explicitly ACK messages; unACKed messages are redelivered
+- **Enqueue messages**: Producers send messages to named queues
+- **Dequeue & process**: Workers receive messages, process them, and ACK — message is **deleted** after ACK
+- **At-least-once delivery**: Unacknowledged messages are redelivered (visibility timeout)
+- **Visibility timeout**: After delivery, message is hidden (not deleted) for a configurable window; if no ACK → becomes visible again
 - **Dead Letter Queue (DLQ)**: Messages that fail N times are moved to a DLQ
-- **Delay queues**: Schedule message delivery after a configurable delay
-- **Fan-out**: One message delivered to multiple consumer groups (pub/sub)
-- **Priority queues**: Higher-priority messages consumed first
+- **Delay queues**: Messages become visible only after a configurable delay
+- **Priority queues**: Higher-priority messages dequeued first
 - **Message TTL**: Messages expire if not consumed within a time window
+- **Fan-out (pub/sub)**: One published message copied to multiple queues via exchange/topic routing
+- **Routing**: Flexible message routing — direct, topic (wildcard), fanout, headers-based (RabbitMQ exchanges)
+- **Request-Reply (RPC)**: Correlation ID + reply-to queue for synchronous-over-async patterns
+- **FIFO ordering**: Optional strict ordering per queue (with deduplication)
+- **Batch operations**: Send/receive/delete messages in batches
 
 ---
 
@@ -21,11 +26,11 @@
 
 - **Durability**: Messages must survive broker failures (persisted to disk, replicated)
 - **High Availability**: 99.99% — queue unavailability blocks entire pipelines
-- **High Throughput**: 1M+ messages/sec across the cluster
-- **Low Latency**: End-to-end < 10 ms p99 for in-memory queues, < 50 ms for durable
-- **Scalability**: Horizontally scalable — add brokers to increase throughput
-- **Exactly-once processing** (optional): Via consumer-side idempotency
-- **Backpressure**: Handle slow consumers without losing messages
+- **Throughput**: ~50K–100K msg/sec per node (RabbitMQ); effectively unlimited horizontal with SQS
+- **Low Latency**: < 5 ms p99 for in-memory queues (RabbitMQ), < 20 ms for SQS
+- **Scalability**: Add nodes to increase queue capacity and consumer parallelism
+- **Message deduplication** (optional): Exactly-once via dedup ID within a window
+- **Backpressure**: Credit-based flow control (push model) or queue depth limits
 
 ---
 
@@ -33,269 +38,414 @@
 
 | Metric | Value |
 |---|---|
-| Messages / day | 50B |
-| Messages / sec | ~580K (peak 2M) |
-| Avg message size | 1 KB |
-| Throughput | 580 MB/s avg, 2 GB/s peak |
-| Retention | 7 days |
-| Storage | 50B × 1 KB × 7 = 350 TB |
-| With replication (RF=3) | ~1 PB |
-| Active queues/topics | 100K |
-| Consumer groups | 500K |
+| Messages / day | 5B |
+| Messages / sec | ~58K (peak 200K) |
+| Avg message size | 2 KB |
+| Throughput | 116 MB/s avg, 400 MB/s peak |
+| Avg time-in-queue | 50 ms (real-time) to 5 min (batch) |
+| Active queues | 50K |
+| Workers (consumers) | 200K |
+| Avg visibility timeout | 30 seconds |
+| In-flight messages (unACKed) | 58K × 30s = ~1.7M |
+| Messages needing persistence | Only unprocessed messages (not retained after ACK) |
+| Storage (7-day TTL worst case) | 5B × 2 KB = 10 TB (transient — most deleted within seconds) |
+
+> **Key difference from Kafka**: Storage is transient. Messages are deleted after ACK, so steady-state storage is small (just in-flight + pending messages), not petabytes of retained logs.
 
 ---
 
 ## 4. High-Level Design (HLD)
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           Producer Pool                  │
-                    │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
-                    │  │P1   │ │P2   │ │P3   │ │P_N  │      │
-                    │  │     │ │     │ │     │ │     │      │
-                    │  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘      │
-                    └─────┼──────┼──────┼──────┼──────────────┘
+                    ┌─────────────────────────────────────────────┐
+                    │            Producer Pool                     │
+                    │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐          │
+                    │  │P1   │ │P2   │ │P3   │ │P_N  │          │
+                    │  └──┬──┘ └──┬──┘ └──┬──┘ └──┬──┘          │
+                    └─────┼──────┼──────┼──────┼──────────────────┘
                           │      │      │      │
-                          │  Partition routing (key hash % N)
+                          │   AMQP / HTTPS / gRPC
                           │      │      │      │
-┌─────────────────────────▼──────▼──────▼──────▼──────────────────┐
-│                     Broker Cluster                                │
-│                                                                   │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐ │
-│  │    Broker 1      │  │    Broker 2      │  │   Broker 3     │ │
-│  │                  │  │                  │  │                │ │
-│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌────────────┐ │ │
-│  │ │ Topic:orders │ │  │ │ Topic:orders │ │  │ │Topic:orders│ │ │
-│  │ │ Partition 0  │ │  │ │ Partition 1  │ │  │ │Partition 2 │ │ │
-│  │ │ ★ LEADER     │ │  │ │ ★ LEADER     │ │  │ │★ LEADER    │ │ │
-│  │ ├──────────────┤ │  │ ├──────────────┤ │  │ ├────────────┤ │ │
-│  │ │ Topic:orders │ │  │ │ Topic:orders │ │  │ │Topic:orders│ │ │
-│  │ │ Partition 2  │ │  │ │ Partition 0  │ │  │ │Partition 1 │ │ │
-│  │ │ ○ FOLLOWER   │ │  │ │ ○ FOLLOWER   │ │  │ │○ FOLLOWER  │ │ │
-│  │ ├──────────────┤ │  │ ├──────────────┤ │  │ ├────────────┤ │ │
-│  │ │ Commit Log   │ │  │ │ Commit Log   │ │  │ │Commit Log  │ │ │
-│  │ │┌────────────┐│ │  │ │┌────────────┐│ │  │ │┌──────────┐│ │ │
-│  │ ││SegFile.log ││ │  │ ││SegFile.log ││ │  │ ││SegFile   ││ │ │
-│  │ ││SegFile.idx ││ │  │ ││SegFile.idx ││ │  │ ││.log .idx ││ │ │
-│  │ ││SegFile.ts  ││ │  │ ││SegFile.ts  ││ │  │ ││.ts       ││ │ │
-│  │ │└────────────┘│ │  │ │└────────────┘│ │  │ │└──────────┘│ │ │
-│  │ │ Page Cache   │ │  │ │ Page Cache   │ │  │ │Page Cache  │ │ │
-│  │ └──────────────┘ │  │ └──────────────┘ │  │ └────────────┘ │ │
-│  └──────────────────┘  └──────────────────┘  └────────────────┘ │
-│                                                                   │
-│  Internal Replication Protocol (Fetch requests between brokers)   │
-└───────────────────────────┬───────────────────────────────────────┘
-                            │
-              ┌─────────────▼─────────────┐
-              │  Controller / Coordinator  │
-              │  (KRaft / ZooKeeper)       │
-              │                            │
-              │  Responsibilities:         │
-              │  • Partition → Leader map  │
-              │  • ISR list maintenance    │
-              │  • Leader election on fail │
-              │  • Topic/Partition config  │
-              │  • Broker liveness (heart.)│
-              │  • Consumer group coords.  │
-              └─────────────┬──────────────┘
-                            │
-┌───────────────────────────▼──────────────────────────────────────┐
-│                    Consumer Group Layer                           │
-│                                                                   │
-│  Consumer Group: "order-processor"                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                       │
-│  │Consumer 1│  │Consumer 2│  │Consumer 3│                       │
-│  │P0 ← Reads│  │P1 ← Reads│  │P2 ← Reads│                       │
-│  │          │  │          │  │          │                       │
-│  │Offset: 42│  │Offset: 87│  │Offset: 33│                       │
-│  └──────────┘  └──────────┘  └──────────┘                       │
-│                                                                   │
-│  Consumer Group: "analytics-pipeline" (independent offsets)       │
-│  ┌──────────┐  ┌──────────┐                                     │
-│  │Consumer A│  │Consumer B│                                     │
-│  │P0,P1     │  │P2        │                                     │
-│  └──────────┘  └──────────┘                                     │
-└──────────────────────────────────────────────────────────────────┘
+                    ┌─────▼──────▼──────▼──────▼──────────────────┐
+                    │          Exchange / Router Layer              │
+                    │                                               │
+                    │  ┌────────────┐  ┌────────────┐              │
+                    │  │  Direct    │  │  Fanout    │              │
+                    │  │  Exchange  │  │  Exchange  │              │
+                    │  └─────┬──┬──┘  └──┬──┬──┬──┘              │
+                    │        │  │        │  │  │                   │
+                    │  Routing key       Copies to all bound queues│
+                    │  matching          (broadcast)               │
+                    │                                               │
+                    │  ┌────────────┐  ┌────────────┐              │
+                    │  │   Topic    │  │  Headers   │              │
+                    │  │  Exchange  │  │  Exchange  │              │
+                    │  │ *.order.#  │  │ x-type=pdf │              │
+                    │  └────────────┘  └────────────┘              │
+                    └─────────┬────────────┬───────────────────────┘
+                              │            │
+              ┌───────────────▼────────────▼──────────────────────┐
+              │              Queue Store (Broker Cluster)          │
+              │                                                    │
+              │  ┌──────────────┐ ┌──────────────┐ ┌───────────┐ │
+              │  │  Queue:      │ │  Queue:      │ │  Queue:   │ │
+              │  │  "orders"    │ │  "emails"    │ │  "images" │ │
+              │  │              │ │              │ │           │ │
+              │  │ ┌──────────┐ │ │ ┌──────────┐ │ │┌─────────┐│ │
+              │  │ │Ready     │ │ │ │Ready     │ │ ││Ready    ││ │
+              │  │ │Messages  │ │ │ │Messages  │ │ ││Messages ││ │
+              │  │ │[M1,M2,M5]│ │ │ │[M3,M7]  │ │ ││[M4,M8]  ││ │
+              │  │ ├──────────┤ │ │ ├──────────┤ │ │├─────────┤│ │
+              │  │ │Unacked   │ │ │ │Unacked   │ │ ││Unacked  ││ │
+              │  │ │(In-flight│ │ │ │{M6→W2,  │ │ ││{M9→W5}  ││ │
+              │  │ │{M4→W1}  │ │ │ │ M8→W3}  │ │ ││         ││ │
+              │  │ ├──────────┤ │ │ ├──────────┤ │ │├─────────┤│ │
+              │  │ │Delayed   │ │ │ │DLQ       │ │ ││Priority ││ │
+              │  │ │(Timer)   │ │ │ │[M_fail]  │ │ ││Heap     ││ │
+              │  │ └──────────┘ │ │ └──────────┘ │ │└─────────┘│ │
+              │  └──────────────┘ └──────────────┘ └───────────┘ │
+              │                                                    │
+              │  Mirrored / Replicated across nodes (Quorum Qs)   │
+              └────────────────────┬───────────────────────────────┘
+                                   │
+                                   │  Push (prefetch) / Pull
+                                   │
+              ┌────────────────────▼───────────────────────────────┐
+              │              Worker Pool (Consumers)                │
+              │                                                     │
+              │  ┌─────────┐  ┌─────────┐  ┌─────────┐            │
+              │  │Worker 1 │  │Worker 2 │  │Worker 3 │            │
+              │  │         │  │         │  │         │            │
+              │  │Process  │  │Process  │  │Process  │            │
+              │  │→ ACK    │  │→ ACK    │  │→ NACK   │            │
+              │  │→ Delete │  │→ Delete │  │→ Requeue│            │
+              │  └─────────┘  └─────────┘  └─────────┘            │
+              └────────────────────────────────────────────────────┘
 ```
 
 ### Component Deep Dive
 
-#### Broker — The Core Processing Unit
+#### Exchange / Router — Message Routing (RabbitMQ model) ⭐
 
-Each broker manages a subset of queues/partitions:
-
-**Storage Engine — Append-Only Commit Log** ⭐:
 ```
-Queue "orders" Partition 0:
-  Segment File: 00000000000000000000.log
-  ┌──────┬──────────┬───────────┬──────┐
-  │Offset│Timestamp │Key        │Value │
-  │  0   │171032000 │order-123  │{...} │
-  │  1   │171032001 │order-124  │{...} │
-  │  2   │171032002 │order-125  │{...} │
-  └──────┴──────────┴───────────┴──────┘
+Producers NEVER send directly to a queue. They send to an Exchange.
+The Exchange routes messages to queues based on Bindings + Routing Key.
+
+Exchange Types:
+┌──────────┬──────────────────────────────────────────────────────────┐
+│ Direct   │ Route to queue whose binding key EXACTLY matches        │
+│          │ routing key. (1-to-1 routing)                           │
+│          │ Ex: routing_key="order.created" → queue "order-process" │
+├──────────┼──────────────────────────────────────────────────────────┤
+│ Fanout   │ Route to ALL bound queues (ignore routing key)          │
+│          │ Ex: "order.created" → queue "email" + "analytics" +     │
+│          │     "inventory" (broadcast / pub-sub)                   │
+├──────────┼──────────────────────────────────────────────────────────┤
+│ Topic    │ Wildcard matching: * = one word, # = zero or more       │
+│          │ Ex: "order.*.shipped" matches "order.us.shipped"        │
+│          │ Binding "order.#" matches "order.us.west.returned"      │
+├──────────┼──────────────────────────────────────────────────────────┤
+│ Headers  │ Route based on message header attributes (not routing   │
+│          │ key). "x-match=all" or "x-match=any"                   │
+└──────────┴──────────────────────────────────────────────────────────┘
+
+This is fundamentally different from Kafka's partition-key routing.
+RabbitMQ exchanges give rich, content-based routing.
+```
+
+#### Queue — The Core Data Structure ⭐
+
+```
+Unlike Kafka (append-only log), a worker queue manages per-message state:
+
+Message States:
+  ┌─────────┐    Dequeue    ┌────────────┐    ACK     ┌─────────┐
+  │  READY  │──────────────→│ IN-FLIGHT  │───────────→│ DELETED │
+  │         │               │ (invisible)│            │         │
+  └─────────┘               └─────┬──────┘            └─────────┘
+       ▲                          │
+       │     Visibility timeout   │ NACK / timeout
+       │     expires              │
+       └──────────────────────────┘
+                                  │ After N retries
+                                  ▼
+                            ┌──────────┐
+                            │   DLQ    │
+                            └──────────┘
+
+Internal data structures per queue:
+  • Ready list:     Ordered list of messages available for delivery (FIFO or priority heap)
+  • Unacked map:    Map<delivery_tag → {message, consumer, expiry_time}> 
+  • Delayed set:    Sorted set by delivery_time (timer wheel or min-heap)
+  • DLQ:            Separate queue for poison messages
+```
+
+#### Storage Engine — NOT an Append-Only Log ⭐
+
+```
+Worker queues need RANDOM DELETES (after ACK), not just appends.
+This changes the storage design fundamentally vs Kafka.
+
+RabbitMQ (Classic Queues):
+  • In-memory queue backed by disk overflow ("paging")
+  • Messages start in RAM → if queue grows too large → page to disk
+  • ACK → delete from both memory and disk index
+  • Problem: Random deletes → disk fragmentation → GC required
   
-  Segment File: 00000000000000050000.log  (new segment after 50K msgs or 1GB)
-  Index File:   00000000000000000000.index (offset → file position mapping)
+RabbitMQ (Quorum Queues) ⭐:
+  • Raft-based replicated log (WAL) per queue
+  • Messages appended to WAL, delivered to consumers
+  • ACKs recorded in WAL → compaction removes ACKed messages
+  • Better durability than classic queues
+  • WAL segments cleaned up after all messages in segment are ACKed
+
+SQS-style (Distributed Hash + Storage):
+  • Messages stored in distributed storage (DynamoDB-like)
+  • Each message has: {msg_id, queue_id, body, visibility_deadline, receive_count}
+  • ReceiveMessage: SELECT WHERE queue_id=X AND visibility_deadline < now LIMIT 10
+  • ACK (DeleteMessage): DELETE WHERE msg_id=Y
+  • Visibility timeout expires: message becomes visible again automatically
+
+  Storage layout:
+  ┌──────────┬──────────┬────────┬─────────────────┬───────────┐
+  │ msg_id   │ queue_id │ body   │ visible_after   │ recv_count│
+  │ uuid-1   │ orders   │ {...}  │ 2025-01-01T00:00│ 0         │ ← ready
+  │ uuid-2   │ orders   │ {...}  │ 2025-01-01T00:35│ 1         │ ← in-flight
+  │ uuid-3   │ orders   │ {...}  │ 2025-01-01T00:00│ 3         │ ← ready (failed 3x)
+  └──────────┴──────────┴────────┴─────────────────┴───────────┘
 ```
 
-- **Why append-only log?** Sequential disk writes are 100× faster than random writes. Even on HDD, sequential I/O achieves 200+ MB/s
-- **Segment rotation**: When a segment reaches size limit (1 GB) or age limit (7 days), create a new segment. Old segments are deleted after retention period
-- **Index files**: Sparse index (every 4 KB) maps offset → byte position in log file. Binary search for O(log N) lookup
-- **Page cache**: OS page cache acts as a natural read cache. Recent messages served from memory, old messages from disk
-
-**Zero-Copy Transfer**:
-```
-Traditional: Disk → Kernel Buffer → User Buffer → Socket Buffer → NIC
-Zero-Copy:   Disk → Kernel Buffer ──────────────→ NIC (via sendfile())
-
-Result: 4× less data copying, 2× less context switches
-Kafka and modern queues use this for consumer reads
-```
-
-#### Message Lifecycle
+#### Visibility Timeout — The Core Worker Queue Mechanism ⭐
 
 ```
-1. Producer sends message to broker
-2. Broker appends to commit log (sequential write to disk)
-3. Broker replicates to follower replicas (async or sync)
-4. Broker ACKs producer (after replication, configurable)
-5. Consumer polls for new messages (long-polling)
-6. Broker sends messages from commit log (zero-copy read)
+This is the defining feature that separates worker queues from event logs.
+
+Flow:
+  1. Worker calls ReceiveMessage → broker picks message M1
+  2. M1's visibility_deadline = now + visibility_timeout (e.g., 30s)
+  3. M1 is INVISIBLE to other workers for 30 seconds
+  4. Worker processes M1 successfully → calls ACK/DeleteMessage → M1 deleted forever
+  
+  If worker crashes:
+  5. 30 seconds pass, no ACK received
+  6. M1's visibility_deadline expires → M1 becomes VISIBLE again
+  7. Another worker picks up M1 → processes it → ACK → deleted
+
+Why not just delete on receive?
+  → If worker crashes after receiving, message is LOST
+  → Visibility timeout gives at-least-once without coordinator tracking
+
+Tuning:
+  Too short (5s):  Worker might still be processing → message redelivered → DUPLICATE
+  Too long (5min): Worker crashes → 5 min delay before retry → slow recovery
+  
+  Best practice: Set to 2-3× expected processing time
+  SQS also supports ChangeMessageVisibility (extend the timeout mid-processing)
+```
+
+#### Message Lifecycle (Worker Queue)
+
+```
+1. Producer sends message to exchange with routing key
+2. Exchange routes message to matching queue(s) based on bindings
+3. Broker persists message to queue (disk + memory)
+4. Broker ACKs producer ("confirmed" / "publisher confirm")
+5. Broker pushes message to consumer (or consumer polls)
+6. Message becomes IN-FLIGHT (invisible to other consumers)
 7. Consumer processes message
-8. Consumer commits offset (ACK)
-9. If no ACK within timeout → message redelivered to another consumer
+8. Consumer sends ACK → message PERMANENTLY DELETED ⭐
+   OR Consumer sends NACK → message requeued (back to ready)
+   OR Visibility timeout expires → message becomes visible again
+9. After N failures → message moved to DLQ
 ```
 
-#### Replication — Leader-Follower Per Partition
+#### Replication — Quorum Queues (RabbitMQ) ⭐
 
 ```
-Partition "orders-0":
-  Leader:    Broker 1  (accepts reads + writes)
-  Follower:  Broker 2  (replicates from leader)
-  Follower:  Broker 3  (replicates from leader)
+Classic Mirrored Queues (legacy, deprecated):
+  Primary + N mirrors. ALL mirrors replicate synchronously.
+  ✗ Slow (write amplification to all mirrors)
+  ✗ Network partition → split-brain → message duplication/loss
+  ✗ Adding mirror = full queue sync (blocks queue)
 
-ISR (In-Sync Replicas): {Broker 1, Broker 2, Broker 3}
-  A replica is "in-sync" if it's within max.lag (e.g., 10 seconds) of the leader
-
-Write Durability (acks config):
-  acks=0:  Don't wait for any ACK (fastest, data loss possible)
-  acks=1:  Wait for leader ACK only (leader writes to disk)
-  acks=all: Wait for ALL ISR replicas to ACK (strongest, slowest)
-```
-
-#### Consumer Groups — Parallel Processing
-
-```
-Topic "orders" with 6 partitions:
-Consumer Group "order-processor":
-  Consumer A: reads from partitions 0, 1
-  Consumer B: reads from partitions 2, 3
-  Consumer C: reads from partitions 4, 5
-
-If Consumer B dies:
-  Rebalance → Consumer A: 0, 1, 2  |  Consumer C: 3, 4, 5
-
-Key insight: Max parallelism = number of partitions
-  10 consumers but 6 partitions → 4 consumers sit idle
-  Solution: Choose partition count carefully (default: 12-64 for most topics)
-```
-
-#### Dead Letter Queue (DLQ)
-
-```
-Message processing fails → retry (up to N times with backoff)
-After N retries → move message to DLQ topic: "orders.dlq"
-
-DLQ allows:
-  - Manual inspection of failed messages
-  - Fix the bug → replay DLQ messages back to original topic
-  - Alert on DLQ growth rate (indicates systematic failures)
-```
-
-#### Delay Queue Implementation
-
-```
-Approach 1: Per-delay-bucket topics
-  Topic: "delayed-5s", "delayed-30s", "delayed-5m", "delayed-1h"
-  Worker reads from each topic, holds messages until delay expires, 
-  then publishes to target topic
+Quorum Queues ⭐ (RabbitMQ 3.8+):
+  Raft consensus (majority-based replication)
   
-Approach 2: Timer wheel (in-broker)
-  Store delayed messages in a hierarchical timing wheel
-  Timer fires at the right moment → message becomes visible
-  Used by: RabbitMQ (delayed message plugin), AWS SQS delay queues
+  Queue "orders" replicated across 3 nodes:
+    Node A: Leader  (accepts writes + reads)
+    Node B: Follower (Raft voter)
+    Node C: Follower (Raft voter)
+  
+  Write path:
+    Producer → Leader → replicate to majority (2 of 3) → ACK producer
+    If Leader dies → Raft elects new leader from followers
+  
+  ✓ No split-brain (Raft guarantees single leader)
+  ✓ Faster than mirroring (only needs majority, not all)
+  ✓ Better availability (survives minority failures)
+  ✗ Higher memory usage (Raft log + in-memory queue state)
 
-Approach 3: Sorted Set in Redis
-  ZADD delayed_msgs {delivery_timestamp} {message_id}
-  Worker polls: ZRANGEBYSCORE delayed_msgs 0 {now}
-  Move due messages to the actual queue
+SQS replication:
+  Fully managed — messages stored redundantly across 3 AZs
+  Invisible to the user — you just get 99.999999999% durability
+```
+
+#### Push vs Pull — Worker Queue is Push-First ⭐
+
+```
+RabbitMQ (Push model ⭐):
+  Consumer registers with broker: "I want messages from queue X"
+  Broker PUSHES messages to consumer as they arrive
+  Consumer sets prefetch_count (e.g., 10) — broker sends up to 10 unACKed messages
+  
+  Advantage: Lowest latency (no polling interval)
+  Backpressure: Consumer stops ACKing → broker stops sending (credit-based flow control)
+
+  basic_consume(queue, callback, prefetch_count=10)
+  → broker pushes messages → callback(message) → ack(delivery_tag)
+
+SQS (Long-polling):
+  Consumer calls ReceiveMessage with WaitTimeSeconds (up to 20s)
+  If messages available → return immediately
+  If no messages → hold connection open up to 20s → return when message arrives
+  
+  Not true push, but long-polling reduces empty responses
+  More scalable for serverless/Lambda patterns
+
+Compare to Kafka (Pull):
+  Consumer polls at its own pace with offset tracking
+  → Better for high-throughput replay scenarios
+  → Worse latency than push (poll interval delay)
 ```
 
 ---
 
 ## 5. APIs
 
-### Producer
+### Producer (SQS-style)
 ```
-publish(topic, key, value, headers, partition) → {offset, partition, timestamp}
-publish_batch(topic, messages[]) → {offsets[]}
+SendMessage(queue_url, body, delay_seconds, message_attributes, dedup_id, group_id)
+  → {message_id, md5_of_body}
+
+SendMessageBatch(queue_url, entries[{id, body, delay, attrs}])
+  → {successful[], failed[]}
 ```
 
-### Consumer
+### Producer (RabbitMQ-style / AMQP)
 ```
-subscribe(topics[], consumer_group)
-poll(timeout_ms) → messages[]
-commit(offsets)      // manual commit
-seek(partition, offset)  // replay from specific position
+basic_publish(exchange, routing_key, body, properties={
+  delivery_mode: 2,         // persistent
+  priority: 5,              // 0-9
+  expiration: "60000",      // TTL in ms
+  correlation_id: "abc",    // for RPC
+  reply_to: "reply-queue",  // for RPC
+  headers: {x-delay: 5000}  // plugin headers
+})
+```
+
+### Consumer (SQS-style)
+```
+ReceiveMessage(queue_url, max_messages=10, wait_time=20, visibility_timeout=30)
+  → messages[{message_id, receipt_handle, body, attributes}]
+
+DeleteMessage(queue_url, receipt_handle)    // ACK — permanently remove
+
+ChangeMessageVisibility(queue_url, receipt_handle, new_timeout)  // extend processing time
+```
+
+### Consumer (RabbitMQ-style / AMQP)
+```
+basic_consume(queue, on_message_callback, auto_ack=false, prefetch_count=10)
+
+// In callback:
+basic_ack(delivery_tag)                    // success — delete message
+basic_nack(delivery_tag, requeue=true)     // failure — put back in queue
+basic_reject(delivery_tag, requeue=false)  // failure — discard or DLQ
 ```
 
 ### Admin
 ```
-create_topic(name, partitions, replication_factor, config)
-delete_topic(name)
-describe_topic(name) → {partitions, replicas, ISR, offsets}
-list_consumer_groups() → groups[]
-get_consumer_lag(group, topic) → {partition: lag}
+CreateQueue(name, attributes={
+  visibility_timeout: 30,
+  message_retention: 345600,      // 4 days
+  max_message_size: 262144,       // 256 KB
+  delay_seconds: 0,
+  dead_letter_queue: "orders-dlq",
+  max_receive_count: 5,           // DLQ threshold
+  fifo_queue: true,               // SQS FIFO
+  content_based_dedup: true
+})
+
+DeleteQueue(queue_url)
+PurgeQueue(queue_url)              // delete all messages
+GetQueueAttributes(queue_url)      // depth, in-flight count, etc.
+ListQueues(prefix)
 ```
 
 ---
 
 ## 6. Data Model
 
-### On-Disk — Commit Log Segment
+### Message (On Disk / In Storage)
 
 ```
-Message Format:
-┌──────────────────────────────────────────────┐
-│ Offset (8 bytes)                              │ monotonically increasing
-│ Message Size (4 bytes)                        │
-│ CRC32 (4 bytes)                               │ integrity check
-│ Magic (1 byte)                                │ format version
-│ Compression (1 byte)                          │ none/gzip/snappy/lz4/zstd
-│ Timestamp (8 bytes)                           │
-│ Key Length (4 bytes) + Key (variable)         │
-│ Value Length (4 bytes) + Value (variable)     │
-│ Headers Length (4 bytes) + Headers (variable) │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ message_id          UUID                              │ globally unique
+│ queue_id            VARCHAR                           │ which queue
+│ body                BLOB (up to 256 KB)               │ message payload
+│ attributes          MAP<string, string>                │ user metadata
+│ system_attributes:                                    │
+│   sent_timestamp    BIGINT                            │ when produced
+│   visible_after     BIGINT                            │ visibility deadline
+│   receive_count     INT                               │ delivery attempts
+│   first_receive_ts  BIGINT                            │ when first delivered
+│   sequence_number   BIGINT (FIFO only)                │ ordering within group
+│   message_group_id  VARCHAR (FIFO only)               │ partition key for ordering
+│   dedup_id          VARCHAR (FIFO only)               │ deduplication window key
+│ receipt_handle      VARCHAR                           │ opaque token for ACK/NACK
+│ priority            INT (0-9)                         │ for priority queues
+│ expiration          BIGINT                            │ message TTL
+│ routing_key         VARCHAR (AMQP)                    │ exchange routing
+│ correlation_id      VARCHAR                           │ RPC correlation
+│ reply_to            VARCHAR                           │ RPC reply queue
+└──────────────────────────────────────────────────────┘
 ```
 
-### Metadata Store (ZooKeeper / etcd)
+### Queue Metadata (Control Plane)
 
 ```
-/brokers/ids/{broker_id} → {host, port, rack}
-/topics/{topic}/partitions/{partition}/state → {leader, isr[], epoch}
-/consumers/{group}/offsets/{topic}/{partition} → {offset, timestamp}
+/queues/{queue_name}/config → {
+  visibility_timeout, max_receive_count, dlq_target,
+  retention_period, delay_seconds, max_message_size,
+  fifo: bool, content_based_dedup: bool
+}
+
+/queues/{queue_name}/stats → {
+  messages_ready, messages_in_flight, messages_delayed,
+  oldest_message_age, consumers_connected
+}
+
+/queues/{queue_name}/bindings → [
+  {exchange: "order-events", routing_key: "order.created"},
+  {exchange: "order-events", routing_key: "order.cancelled"}
+]
 ```
 
-### Consumer Offset Storage
+### Consumer State (Broker-Tracked)
 
 ```
-Option 1: ZooKeeper (Kafka legacy) — ZK becomes bottleneck
-Option 2: Internal topic "__consumer_offsets" ⭐ (Kafka modern)
-  - Compacted topic: only latest offset per consumer-group-partition retained
-  - Replicated for durability
-  - Consumers commit offsets by producing to this topic
+Unlike Kafka (consumer tracks its own offset), the BROKER tracks per-message state:
+
+In-Flight Tracking:
+  Map<receipt_handle → {
+    message_id,
+    consumer_id,
+    delivery_time,
+    visibility_deadline,
+    delivery_attempt
+  }>
+
+  Timer thread scans for visibility_deadline < now() → requeue message
 ```
 
 ---
@@ -304,337 +454,434 @@ Option 2: Internal topic "__consumer_offsets" ⭐ (Kafka modern)
 
 | Concern | Solution |
 |---|---|
-| **Broker failure** | Leader election from ISR; followers become new leader. Producers/consumers discover new leader from metadata |
-| **Message loss** | acks=all ensures all ISR replicas have the message before ACK |
-| **Consumer failure** | Consumer group rebalance redistributes partitions to surviving consumers |
-| **Network partition** | Min ISR config prevents writes when too few replicas are available (no split-brain writes) |
-| **Disk failure** | Replicas on different brokers/racks/AZs. Failed broker's data rebuilt from replicas |
-| **Poison message** | DLQ after N retries prevents one bad message from blocking the queue |
-| **Consumer lag** | Monitor lag per consumer group; alert when lag exceeds threshold; auto-scale consumers |
+| **Broker failure** | Quorum queue: Raft leader election from followers. SQS: multi-AZ redundancy transparent to user |
+| **Message loss** | Publisher confirms (RabbitMQ) / durable queues. Message persisted + replicated BEFORE producer ACK |
+| **Consumer failure** | Visibility timeout expires → message becomes visible → another worker picks it up |
+| **Poison message** | DLQ after N receive_count. Prevents one bad message from blocking the queue forever |
+| **Network partition** | Quorum queues: minority partition becomes read-only, majority continues. Pause-minority mode in RabbitMQ |
+| **Duplicate delivery** | At-least-once is default. Consumer-side idempotency (dedup key) for exactly-once |
+| **Queue overflow** | Lazy queues (RabbitMQ): page to disk aggressively. SQS: effectively unlimited depth |
+| **Slow consumer** | Prefetch limit (push model) or long-poll timeout (pull model). Alert on queue depth growth |
 
-### Exactly-Once Semantics
+### Publisher Confirms — Ensuring No Message Loss ⭐
 
 ```
-Producer side (idempotent producer):
-  Each producer has a unique PID (Producer ID)
-  Each message has a sequence number per partition
-  Broker deduplicates: if (PID, partition, sequence) already seen → discard
+Fire-and-forget (default):
+  Producer sends → no confirmation → message might be lost if broker crashes
+
+Publisher Confirms (RabbitMQ) / SendMessage response (SQS) ⭐:
+  Producer sends → broker persists to disk + replicates → sends CONFIRM back
+  Producer only considers message "sent" after receiving confirm
   
-Consumer side (transactional processing):
-  Read message → process → write result + commit offset in ONE transaction
-  If consumer crashes before commit → message reprocessed → result is idempotent
-  Requires: transactional producer API + read_committed isolation level
+  If no confirm within timeout → producer retries
+  
+  RabbitMQ implementation:
+    channel.confirm_select()              // enable confirms
+    channel.basic_publish(msg)
+    channel.wait_for_confirms(timeout=5)  // block until broker confirms
+    
+    Or async: publisher_confirm_callback(ack/nack, delivery_tag)
+    
+  Batched confirms:
+    Publish 100 messages → wait_for_confirms() → all 100 confirmed at once
+    More efficient than confirming each message individually
 ```
 
 ### Race Condition Deep Dives
 
-#### 1. Consumer Rebalance — The Stop-the-World Problem
+#### 1. Visibility Timeout Race — Double Processing ⭐
 
 ```
-Scenario: Consumer Group with 3 consumers, 6 partitions.
-  Consumer B crashes → triggers rebalance.
+Scenario: Worker A receives message M1 with visibility_timeout = 30s.
+Worker A processes M1 but takes 35 seconds (slow DB call).
 
-EAGER rebalance (legacy):
-  T=0:    Consumer B crashes
-  T=0.1s: Coordinator detects heartbeat timeout (session.timeout.ms)
-  T=0.1s: Coordinator sends "REVOKE ALL" to Consumer A and C
-  T=0.1s: ALL consumers STOP processing (even healthy ones!)
-  T=0.2s: Consumers A and C re-join consumer group
-  T=0.5s: Coordinator assigns: A → {P0,P1,P2}, C → {P3,P4,P5}
-  T=0.5s: Consumers resume processing
+  T=0s:   Worker A receives M1. visibility_deadline = T+30s
+  T=30s:  M1's deadline expires. M1 becomes VISIBLE again.
+  T=31s:  Worker B receives M1 (it looks like a new message)
+  T=35s:  Worker A finishes processing M1. Calls DeleteMessage(receipt_handle_A)
+  T=36s:  Worker B finishes processing M1. Calls DeleteMessage(receipt_handle_B)
   
-  ⚠️ DOWNTIME: 0.5 seconds of ZERO processing across ALL partitions
-  At 500K msgs/sec → 250K messages delayed during rebalance
-
-COOPERATIVE (incremental) rebalance ⭐:
-  T=0:    Consumer B crashes
-  T=0.1s: Coordinator detects heartbeat timeout
-  T=0.1s: Coordinator sends "REVOKE P2,P3 from B only" 
-  T=0.1s: Consumer A keeps processing P0,P1 (never stopped!)
-  T=0.1s: Consumer C keeps processing P4,P5 (never stopped!)
-  T=0.2s: Coordinator assigns B's partitions: A gets P2, C gets P3
-  
-  ⚠️ Only B's partitions paused. A and C NEVER stopped.
-  Downtime: 0.2 seconds, only for 2 out of 6 partitions
-```
-
-#### 2. Duplicate Message on Producer Retry
-
-```
-Producer sends message → Broker receives, writes to log, but ACK is LOST in network
-Producer doesn't get ACK → retries → Broker receives AGAIN → writes DUPLICATE
-
-Without idempotent producer:
-  Offset 42: {order-123, "payment_confirmed"}    ← original
-  Offset 43: {order-123, "payment_confirmed"}    ← DUPLICATE!
-  
-  Consumer processes both → double payment!
-
-With idempotent producer ⭐:
-  Producer sends: PID=7, Sequence=15, message={order-123, ...}
-  Broker receives: check (PID=7, Partition=0, Sequence=15) — already seen!
-  Broker returns: ACK with existing offset (no duplicate write)
-  
-  Implementation:
-    Broker maintains: Map<(PID, Partition), max_sequence> in memory
-    If incoming_seq <= stored_max_seq → duplicate → discard
-    This map is persisted in the partition log (.snapshot file)
-```
-
-#### 3. Offset Commit Race — The "At-Least-Once" Gap
-
-```
-Scenario: Consumer reads message at offset 50, processes it, then commits.
-
-RISK: Consumer crashes AFTER processing but BEFORE committing offset.
-  T=0:   Consumer reads offset 50
-  T=0.1: Consumer processes message (e.g., inserts into DB)
-  T=0.2: Consumer CRASHES before commit()
-  T=1.0: Consumer restarts, resumes from last committed offset = 49
-  T=1.1: Consumer re-reads offset 50 → processes AGAIN → duplicate DB insert
+  Result: M1 processed TWICE! Potential double side effects.
 
 Solutions:
-  1. Idempotent consumer ⭐: Consumer writes to DB with idempotency key (message offset)
-     INSERT INTO processed (id, data) VALUES (50, ...) ON CONFLICT DO NOTHING
-  
-  2. Exactly-once with transactions:
-     Consumer reads msg → BEGIN TXN → write result + commit offset → END TXN
-     Both succeed or both fail (requires Kafka Transactions API)
-  
-  3. Outbox pattern:
-     Consumer writes result + offset to same DB in one transaction
-     On restart, read last committed offset from DB, not Kafka
+  1. ChangeMessageVisibility ⭐: Worker A extends timeout mid-processing
+     "I'm still working, give me 30 more seconds"
+     Worker A: heartbeat thread extends visibility every 20s while processing
+     
+  2. Idempotent consumers ⭐:
+     Consumer writes result with idempotency key = message_id
+     Second processing attempt → ON CONFLICT DO NOTHING / conditional write
+     
+  3. Receipt handle invalidation (SQS behavior):
+     When M1 is redelivered to Worker B, Worker B gets a NEW receipt_handle
+     Worker A's old receipt_handle becomes INVALID
+     Worker A's DeleteMessage fails (stale handle) → Worker A knows it lost the message
+     But Worker A's side effects already happened → still need idempotency!
 ```
 
-#### 4. ISR Shrinkage — Data Loss Window
+#### 2. Consumer Prefetch Starvation
 
 ```
-Partition with ISR = {Broker1 (leader), Broker2, Broker3}
+Scenario: RabbitMQ push model with prefetch_count=100.
+Consumer A is slow. It has 100 unACKed messages.
 
-T=0:   Broker3 slows down (GC pause, disk I/O)
-T=10s: Broker3 falls out of ISR. ISR = {Broker1, Broker2}
-T=10s: acks=all now means acks={Broker1, Broker2} ← only 2 replicas!
-T=15s: Broker1 (leader) crashes. Only Broker2 has all data.
-T=15s: Broker2 becomes leader. Broker3 is behind → data gap.
-
-If min.insync.replicas=2 and ISR drops to {Broker1} only:
-  Broker REJECTS writes (NotEnoughReplicas exception)
-  → No data loss but availability reduced (unavailable for writes)
+  Broker has 500 messages in queue.
+  Consumer A: 100 messages in-flight (at capacity, broker stops pushing)
+  Consumer B: 0 messages (idle! broker gave everything to A first)
   
-Config recommendation for durability:
-  acks=all + min.insync.replicas=2 + replication.factor=3
-  → Guarantees at least 2 copies exist before ACK
-  → Survives 1 broker failure without data loss
-  → If 2 brokers fail → writes rejected (unavailable, but no loss)
+  Problem: Consumer B starves because A hogged all the prefetched messages.
+
+Solution: prefetch_count should be SMALL ⭐
+  prefetch_count=1:  Perfect fairness, but high latency (1 message at a time)
+  prefetch_count=10: Good balance (fair distribution, reasonable batching)
+  prefetch_count=100: Only if consumers are fast and uniform
+
+  RabbitMQ also supports global prefetch (shared across all consumers on a channel)
+  vs per-consumer prefetch (each consumer gets its own limit)
+```
+
+#### 3. FIFO Queue Head-of-Line Blocking
+
+```
+SQS FIFO queues use message_group_id for ordered processing.
+All messages with same group_id are delivered IN ORDER to ONE consumer.
+
+Scenario: group_id="user-123" has messages [M1, M2, M3, M4]
+  M1 delivered to Worker A → Worker A processing (M2, M3, M4 BLOCKED)
+  Worker A is slow → entire group "user-123" is stuck!
+  
+  Meanwhile, group_id="user-456" messages flow freely to other workers.
+
+  This is HEAD-OF-LINE BLOCKING per message group.
+
+Solutions:
+  1. Small message groups ⭐: Use fine-grained group IDs
+     Don't use group_id="all-orders" (one big group = no parallelism)
+     Use group_id="order-{order_id}" (each order is independent)
+     
+  2. Short visibility timeout: If worker is stuck, message returns quickly
+  
+  3. Monitor per-group depth: Alert if one group's depth grows disproportionately
+```
+
+#### 4. Redelivery Storm After Broker Restart
+
+```
+Scenario: Broker crashes and restarts. 10,000 messages were in-flight (unACKed).
+
+  On restart: ALL 10,000 messages become visible simultaneously
+  (their visibility deadlines have passed during downtime)
+  
+  Workers suddenly flooded with 10,000 messages at once → CPU/memory spike
+  Workers might crash → messages go back to queue → vicious cycle
+
+Solutions:
+  1. Gradual redelivery ⭐: Broker doesn't make all messages visible at once
+     Stagger: make 100 visible per second over 100 seconds
+     
+  2. Consumer rate limiting: Workers limit their own receive rate
+     Even if queue has 10K messages, receive at most 50/sec per worker
+     
+  3. Auto-scaling: CloudWatch/metrics trigger → scale up workers when queue depth spikes
 ```
 
 ### Scale Challenges
 
-#### Partition Count Selection
+#### Scaling a Single Queue to High Throughput
 
 ```
-Too few partitions (e.g., 1):
-  → Max 1 consumer → throughput bottleneck (single-threaded consumption)
-  → All data on one broker → hot spot
+Problem: A single queue is a single ordered data structure → hard to parallelize.
 
-Too many partitions (e.g., 10,000 per topic):
-  → Each partition = 1 open file handle → FD exhaustion
-  → Each partition leader election takes time → slow recovery
-  → More ZooKeeper/KRaft metadata → memory pressure
-  → Consumer rebalance scans all partitions → slow rebalance
-
-Formula for partition count:
-  partitions = max(
-    throughput_target / throughput_per_partition,
-    max_consumer_count
-  )
+RabbitMQ approach:
+  Single queue = single Erlang process = single CPU core
+  Max throughput per queue: ~30-50K msg/sec
+  Scale by: Creating multiple queues + sharding messages across them
   
-  Example: 100 MB/s target, 10 MB/s per partition → 10 partitions minimum
-  But if we want 20 consumers → need 20 partitions
+  Sharded queues:
+    Producer hashes message key → picks queue shard
+    "orders-0", "orders-1", "orders-2", ... "orders-15"
+    Each shard is an independent queue on potentially different nodes
+    ✓ 16 shards × 50K = 800K msg/sec
+    ✗ No global ordering across shards
+    ✗ Client must handle sharding logic
 
-  Industry defaults: 6-64 partitions per topic
-  Kafka limit: ~200K partitions per cluster (KRaft handles better than ZooKeeper)
-```
-
-#### Log Compaction — Keeping Only Latest Value Per Key
-
-```
-Normal retention: Delete entire segment after 7 days
-Log compaction: Keep ONLY the latest message per key (forever)
-
-Use case: Changelog / state store
-  Key: user-123, Value: {name: "Alice", email: "alice@example.com"}  (v1)
-  Key: user-123, Value: {name: "Alice Smith", ...}                    (v2)
-  Key: user-456, Value: {name: "Bob", ...}                           (v1)
+SQS approach:
+  Single standard queue = virtually unlimited throughput (internally sharded)
+  SQS manages sharding invisibly — you just send/receive
+  FIFO queue: 300 msg/sec per group_id, 3000 msg/sec per queue (with batching)
   
-  After compaction:
-  Key: user-123, Value: {name: "Alice Smith", ...}  (only latest v2 kept)
-  Key: user-456, Value: {name: "Bob", ...}          (latest v1 kept)
+  How SQS scales internally:
+    Messages distributed across multiple internal partitions
+    ReceiveMessage samples from random partitions → eventually consistent visibility
+    This is why SQS standard queue does NOT guarantee FIFO (messages from different 
+    partitions may arrive out of order)
+```
 
-  Tombstone: Key: user-123, Value: null → deletes the key after grace period
+#### Queue Depth Monitoring and Auto-scaling
 
-Used by: __consumer_offsets topic, Kafka Streams state stores, CDC pipelines
+```
+Key metrics to monitor:
+  • ApproximateNumberOfMessagesVisible (queue depth)
+  • ApproximateNumberOfMessagesNotVisible (in-flight)
+  • ApproximateAgeOfOldestMessage
+  • NumberOfMessagesSent (enqueue rate)
+  • NumberOfMessagesReceived (dequeue rate)
+
+Auto-scaling formula:
+  desired_workers = queue_depth / (processing_rate_per_worker × acceptable_drain_time)
+  
+  Example: 10,000 messages, each worker processes 100/min, want drained in 5 min
+  desired_workers = 10,000 / (100 × 5) = 20 workers
+  
+  SQS + Lambda: Automatic scaling — Lambda spawns new invocations per message
+  SQS + ECS/K8s: KEDA or custom HPA based on queue depth metric
 ```
 
 ---
 
 ## 8. Additional Considerations
 
-### Push vs Pull Consumers
+### Delay Queue Implementation
 
-| Model | How | Pros | Cons |
-|---|---|---|---|
-| **Push** (RabbitMQ) | Broker pushes to consumer | Lower latency; immediate delivery | Broker must track consumer pace; backpressure complexity |
-| **Pull** (Kafka) ⭐ | Consumer polls broker | Consumer controls pace; batching; backpressure natural | Slight latency (poll interval); long-polling mitigates this |
-
-### Backpressure Handling
-- **Pull model**: Consumer simply polls slower → backpressure is automatic
-- **Push model**: Broker must implement flow control (credit-based: "you can send me 100 more messages")
-- **Queue depth monitoring**: Alert when queue depth > threshold → scale consumers
-
-### Message Ordering Guarantees
 ```
-Global ordering: Only possible with 1 partition → limits throughput to 1 consumer
-Partition ordering: Messages with same key → same partition → ordered within partition
-  Use: key = user_id → all events for a user are ordered
+Approach 1: Per-message delay (SQS DelaySeconds, RabbitMQ x-delay header)
+  Message M1 sent with delay=60s → M1 not visible until now()+60s
+  Implementation: Store M1 with visible_after = now()+60s
+  Timer/scheduler thread: periodically scan for visible_after < now() → make visible
   
-Caution: Consumer rebalance can temporarily break ordering
-  Mitigation: Cooperative rebalance (incremental, not stop-the-world)
+  SQS: DelaySeconds per message (0-900s) or default queue delay
+  RabbitMQ: rabbitmq-delayed-message-exchange plugin (stores in Mnesia, timer-based)
+
+Approach 2: Timer wheel (in-broker, high performance) ⭐
+  Hierarchical timing wheel:
+    Wheel 1 (seconds): 60 slots (0-59s)
+    Wheel 2 (minutes): 60 slots (0-59min)
+    Wheel 3 (hours):   24 slots (0-23h)
+  
+  Insert delay=90s → Wheel 2, slot 1 (1 minute), sub-slot 30s
+  Timer ticks every second → when slot fires → promote to inner wheel or deliver
+  
+  O(1) insert and O(1) fire — much better than sorted set for high volume
+
+Approach 3: Sorted set (Redis or DB-backed)
+  ZADD delayed_msgs {delivery_timestamp} {message_id}
+  Worker polls: ZRANGEBYSCORE delayed_msgs -inf {now} LIMIT 100
+  Move due messages to the ready queue
+  Simple but requires polling → slight latency
+```
+
+### Priority Queue Implementation
+
+```
+RabbitMQ supports 0-255 priority levels (recommend 1-10).
+
+Internal structure: One ready sub-queue per priority level
+  Priority 9 (highest): [M1, M4]
+  Priority 5 (medium):  [M2, M7, M8]
+  Priority 1 (lowest):  [M3, M5, M6]
+
+  Dequeue: Always drain highest non-empty priority first
+  
+  ⚠️ Starvation: Low-priority messages may NEVER be consumed if high-priority
+  messages keep arriving. Solution: Aging — increase priority of old messages.
+
+SQS does NOT support priority queues natively.
+  Workaround: Separate queues per priority + weighted polling
+    "orders-high" → poll 80% of the time
+    "orders-low"  → poll 20% of the time
+```
+
+### Request-Reply Pattern (RPC over Queue)
+
+```
+Client → Request Queue → Server processes → Reply Queue → Client
+
+  Client:
+    1. Create exclusive reply queue: "reply-{uuid}"
+    2. Publish to "rpc-queue" with:
+       correlation_id: "req-123"
+       reply_to: "reply-{uuid}"
+    3. Consume from "reply-{uuid}", wait for correlation_id match
+    
+  Server:
+    1. Consume from "rpc-queue"
+    2. Process request
+    3. Publish response to message.reply_to with same correlation_id
+
+  Timeout: Client waits max 5s for reply → if no reply → error
+
+  This is synchronous-over-async: client blocks waiting for response.
+  Used by: Microservice RPC, distributed task results (Celery)
+```
+
+### Message Deduplication (Exactly-Once Producing)
+
+```
+SQS FIFO:
+  Producer sends with dedup_id="order-123-payment"
+  SQS stores dedup_id for 5-minute window
+  If same dedup_id arrives within 5 min → silently dropped (no duplicate)
+  
+  Content-based dedup (alternative):
+  SQS hashes message body → uses hash as dedup_id automatically
+
+RabbitMQ:
+  No built-in dedup. Options:
+  1. Publisher confirms + idempotent consumer (most common)
+  2. Dedup plugin: maintains a cache of recent message IDs
+  3. Application-level: check DB before processing
 ```
 
 ---
 
 ## 9. Deep Dive: Engineering Trade-offs
 
-### Kafka vs RabbitMQ vs SQS: When to Choose What
+### RabbitMQ vs SQS vs Kafka — When to Choose What
 
-| Feature | Kafka | RabbitMQ | AWS SQS |
+| Feature | RabbitMQ | AWS SQS | Kafka |
 |---|---|---|---|
-| **Model** | Distributed log (pull) | Message broker (push) | Managed queue (pull) |
-| **Throughput** | 1M+ msg/sec | ~50K msg/sec | ~3K msg/sec per queue |
-| **Ordering** | Per-partition FIFO | Per-queue FIFO | FIFO queues (limited) |
-| **Retention** | Configurable (days/weeks) | Until consumed | 14 days max |
-| **Replay** | ✓ (seek to any offset) | ✗ (message deleted after ACK) | ✗ |
-| **Exactly-once** | ✓ (transactional API) | ✗ (at-least-once) | ✗ (at-least-once) |
-| **Routing** | Partition key | Exchange types (direct, fanout, topic, headers) | None |
-| **Operations** | Complex (ZK/KRaft, brokers) | Moderate | Zero (managed) |
+| **Model** | Broker (push, AMQP) | Managed queue (poll) | Distributed log (pull) |
+| **Message fate** | **Deleted after ACK** ⭐ | **Deleted after ACK** ⭐ | **Retained (log)** |
+| **Throughput** | ~50K msg/sec/node | ~3K/sec/queue (standard unlimited) | 1M+ msg/sec |
+| **Latency** | < 1ms (in-memory) | 1-10ms | 2-10ms |
+| **Ordering** | Per-queue FIFO | FIFO queues (per group) | Per-partition FIFO |
+| **Routing** | Exchanges (rich) ⭐ | None | Partition key only |
+| **Priority** | ✓ (0-255) ⭐ | ✗ | ✗ |
+| **Delay** | Plugin-based | ✓ (0-15min) | ✗ (workaround only) |
+| **Replay** | ✗ (deleted on ACK) | ✗ (deleted on ACK) | ✓ (seek to offset) ⭐ |
+| **Visibility timeout** | Basic (prefetch + NACK) | ✓ (first-class) ⭐ | N/A (offset-based) |
+| **Exactly-once** | ✗ (at-least-once) | ✓ (FIFO dedup) | ✓ (transactional) |
+| **Operations** | Moderate (Erlang cluster) | Zero (managed) ⭐ | Complex (brokers, ZK) |
+| **Best for** | Complex routing, RPC, low latency | Simple decoupling, serverless | Event streaming, replay |
 
-**Choose Kafka when**: High throughput, event streaming, replay needed, log compaction
-**Choose RabbitMQ when**: Complex routing, priority queues, request-reply patterns, lower throughput
-**Choose SQS when**: Simple decoupling, zero-ops, AWS-native, moderate throughput
-
-### Append-Only Log vs Traditional Queue: The Fundamental Design Choice
-
-```
-Traditional Queue (RabbitMQ):
-  Message consumed → DELETED from queue
-  ✓ Simple mental model
-  ✗ No replay (message gone forever after ACK)
-  ✗ Multiple consumers need multiple copies
-  ✗ Random deletes → disk fragmentation
-
-Append-Only Log (Kafka) ⭐:
-  Message consumed → offset advances, message STAYS
-  ✓ Replay: reset offset to any point in time
-  ✓ Multiple consumer groups read independently (no duplication)
-  ✓ Sequential I/O → 10× higher throughput
-  ✓ Natural event sourcing / audit log
-  ✗ Storage grows with retention (must eventually delete old segments)
-  ✗ No per-message deletion (can't remove a single "bad" message)
-```
-
-### In-Memory vs Disk-Backed: Latency vs Durability
+### Classic Queue vs Quorum Queue vs Stream (RabbitMQ)
 
 ```
-In-memory queue (Redis, ZeroMQ):
-  Latency: < 1 ms
-  Durability: NONE (unless persisted)
-  Throughput: Very high
-  Use for: Inter-process communication, real-time signaling
+Classic Queue (legacy):
+  Single leader, optional mirrors (synchronous replication to ALL mirrors)
+  ✓ Fastest (single-node, in-memory)
+  ✗ Not safe: mirror sync can block queue, split-brain possible
+  ✗ Deprecated for most use cases
 
-Disk-backed with page cache (Kafka):
-  Latency: 2-10 ms
-  Durability: Survives process crash (data on disk)
-  Throughput: High (sequential I/O + page cache)
-  Use for: Event streaming, reliable messaging
+Quorum Queue ⭐ (RabbitMQ 3.8+):
+  Raft-based. Majority replication. Leader + N followers.
+  ✓ Safe: no split-brain, tolerates minority failures
+  ✓ Automatic leader election
+  ✓ Poison message handling (delivery_limit built-in)
+  ✗ ~20% slower than classic (Raft overhead)
+  ✗ No priority queue support
+  ✗ No lazy queue (all in memory + WAL)
+  Best for: Most production workloads
 
-Fully durable (acks=all, fsync):
-  Latency: 10-50 ms
-  Durability: Survives machine crash
-  Throughput: Lower (must fsync to disk)
-  Use for: Financial transactions, critical events
+Stream (RabbitMQ 3.9+):
+  Append-only log (Kafka-like!) within RabbitMQ
+  ✓ Replay, multiple consumers, high throughput
+  ✓ Use RabbitMQ for both queue AND stream workloads
+  ✗ No routing/exchange semantics
+  ✗ Not a traditional queue (offset-based like Kafka)
+  Best for: Event streaming when you already have RabbitMQ
 ```
 
-### ZooKeeper vs KRaft: Why Kafka Is Removing ZooKeeper
+### SQS Standard vs FIFO Queue
 
 ```
-ZooKeeper (legacy):
-  Separate cluster (3-5 ZK nodes) manages all Kafka metadata
-  ✗ Operational burden: maintain two distributed systems
-  ✗ ZK bottleneck: metadata operations serialized through ZK leader
-  ✗ Partition limit: ZK struggles above ~200K partitions per cluster
-  ✗ Slow controller failover: new controller must reload ALL metadata from ZK (minutes)
-  ✗ ZK data model doesn't match Kafka's needs (ephemeral znodes, watches)
-
-KRaft ⭐ (Kafka 3.3+, production-ready):
-  Metadata managed by Kafka brokers themselves using Raft consensus
-  ✓ No external dependency (single system to operate)
-  ✓ Metadata in Raft log: faster reads, faster failover
-  ✓ Scales to millions of partitions per cluster
-  ✓ Controller failover in seconds (not minutes)
-  ✓ Simpler operational model
+Standard Queue:
+  ✓ Nearly unlimited throughput
+  ✓ At-least-once delivery
+  ✗ Best-effort ordering (NOT strict FIFO)
+  ✗ Occasional duplicates
   
-  How KRaft works:
-    3-5 brokers designated as "controllers" (voters in Raft quorum)
-    One controller is the active controller (Raft leader)
-    All metadata changes are committed to the metadata log (Raft)
-    Non-controller brokers receive metadata updates via the log
+  Why not FIFO? SQS standard is internally sharded across many servers.
+  Messages on different shards may be delivered out of order.
+  Two ReceiveMessage calls may hit different shards.
+
+FIFO Queue:
+  ✓ Strict ordering per message_group_id
+  ✓ Exactly-once processing (dedup within 5-min window)
+  ✗ 300 messages/sec per group, 3000/sec per queue (with batching)
+  ✗ Higher latency (ordering requires coordination)
+  
+  How ordering works:
+    Messages with same group_id always delivered in order
+    Different group_ids can be processed in parallel
+    One in-flight message per group_id → head-of-line blocking within group
+
+  Choose Standard for: High throughput, order doesn't matter
+  Choose FIFO for: Financial transactions, user-action ordering
 ```
 
-### Producer Batching and Compression — The Throughput Multiplier
+### Worker Queue vs Event Log: Fundamental Design Choice
 
 ```
-Without batching:
-  1 message = 1 network round-trip = 1 disk write
-  At 1 KB/msg → 1M msgs/sec = 1M network calls = IMPOSSIBLE
+┌──────────────────────┬───────────────────────┬────────────────────────┐
+│                      │ Worker Queue           │ Event Log (Kafka)      │
+│                      │ (RabbitMQ/SQS)         │                        │
+├──────────────────────┼───────────────────────┼────────────────────────┤
+│ Mental model         │ Task list / inbox      │ Immutable event ledger │
+│ Message after ACK    │ DELETED ⭐             │ RETAINED ⭐            │
+│ Consumer state       │ Broker tracks          │ Consumer tracks offset │
+│ Delivery model       │ Push (broker → worker) │ Pull (consumer → log)  │
+│ Routing              │ Rich (exchanges)       │ Partition key only     │
+│ Replay               │ Not possible           │ Seek to any offset     │
+│ Ordering             │ Per-queue FIFO         │ Per-partition FIFO     │
+│ Consumer parallelism │ Add workers freely ⭐  │ Limited by partitions  │
+│ Storage growth       │ Bounded (transient)    │ Unbounded (retention)  │
+│ Use case             │ Job processing, RPC    │ Event sourcing, CDC    │
+│ Analogy              │ Email inbox            │ Git commit log         │
+└──────────────────────┴───────────────────────┴────────────────────────┘
 
-With batching ⭐:
-  Producer buffers messages locally for up to linger.ms (e.g., 5ms)
-  Or until batch reaches batch.size (e.g., 64 KB)
-  Then sends ONE network request with entire batch
+When the interviewer says "Design a Worker Queue":
+  → Think RabbitMQ/SQS: delete on ACK, visibility timeout, exchanges, DLQ, priority
+  → Do NOT talk about offsets, partitions, ISR, consumer groups, log compaction
 
-  Compression on the batch (snappy/lz4/zstd):
-    64 KB batch → compressed to ~15 KB → 4× bandwidth reduction
-    Compression happens once at producer, stored compressed on broker,
-    decompressed at consumer → broker does zero compression work
-
-  Impact:
-    Without batching: 1M separate requests → overwhelm network
-    With batching: 1M messages in ~15K batches → 15K network calls → easy
-    
-  Throughput improvement: 10-50× with batching + compression
+When the interviewer says "Design a Message Broker / Event Streaming":
+  → Think Kafka: append-only log, partitions, offsets, consumer groups, replay
+  → See 31_2_Distributed_Message_Broker.md
 ```
 
-### Message Delivery Semantics — A Complete Framework
+### Exactly-Once Processing in Worker Queues
 
 ```
-┌────��─────────────────────────────────────────────────────────────────┐
-│                        Delivery Guarantee Matrix                      │
-├─────────────────┬────────────────┬────────────────┬──────────────────┤
-│                 │ At-Most-Once   │ At-Least-Once  │ Exactly-Once     │
-├─────────────────┼────────────────┼────────────────┼──────────────────┤
-│ Producer        │ acks=0         │ acks=all       │ acks=all         │
-│                 │ no retry       │ retries=MAX    │ enable.idempot.  │
-│                 │                │                │ transactional.id │
-├─────────────────┼────────────────┼────────────────┼──────────────────┤
-│ Consumer        │ commit before  │ commit after   │ read_committed + │
-│                 │ processing     │ processing     │ transactional    │
-│                 │                │                │ offset commit    │
-├─────────────────┼────────────────┼────────────────┼──────────────────┤
-│ Data Loss?      │ YES            │ NO             │ NO               │
-│ Duplicates?     │ NO             │ YES            │ NO               │
-│ Use Case        │ Metrics/logs   │ Most workloads │ Financial/orders │
-│ Performance     │ Fastest        │ Fast           │ Slowest (~20%)   │
-└─────────────────┴────────────────┴────────────────┴──────────────────┘
+At-least-once is the DEFAULT for all worker queues.
+True exactly-once requires consumer-side cooperation:
+
+Pattern 1: Idempotency key ⭐
+  Consumer checks: "Have I processed message_id X before?"
+  INSERT INTO results (msg_id, result) VALUES (X, ...) ON CONFLICT DO NOTHING
+  If duplicate delivery → DB rejects → no side effect
+
+Pattern 2: SQS FIFO dedup
+  Producer attaches dedup_id to each message
+  SQS drops duplicate sends within 5-minute window
+  + Idempotent consumer = end-to-end exactly-once
+
+Pattern 3: Transactional outbox
+  Consumer: BEGIN TXN → write result + mark msg_id as processed → COMMIT
+  If crash before commit → both rolled back → message retried → safe
+  If crash after commit → message already marked → skip on retry
 ```
 
+### Credit-Based Flow Control (RabbitMQ Backpressure)
+
+```
+Problem: If broker pushes messages faster than consumer can process,
+consumer's memory fills up → crash.
+
+Credit system:
+  Consumer connects → broker grants N credits (e.g., 10)
+  Each message pushed = 1 credit consumed
+  When consumer ACKs → broker replenishes credits
+  When credits = 0 → broker STOPS pushing to that consumer
+  
+  This is TCP-like flow control at the application level.
+  
+  tcp_back_pressure: If socket send buffer is full, broker stops reading from queue
+  memory_alarm: If broker memory > threshold (40% default), BLOCK all publishers
+  disk_alarm: If free disk < threshold, BLOCK all publishers
+  
+  These are RabbitMQ's multi-level backpressure mechanisms:
+    Level 1: Per-consumer prefetch (credit-based)
+    Level 2: Per-connection TCP backpressure
+    Level 3: Broker-wide memory alarm (block publishers)
+    Level 4: Broker-wide disk alarm (block publishers)
+```
