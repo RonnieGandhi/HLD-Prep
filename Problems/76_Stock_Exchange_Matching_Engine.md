@@ -176,6 +176,78 @@
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Complete Order-to-Trade Flow — Step-by-Step Sequence
+
+```
+Broker           FIX GW         Order Router     Risk Engine      Sequencer        Matching Engine    Exec Reporter    Mkt Data Pub
+  │                │                │                │                │                │                │                │
+  │── New Order ──▶│                │                │                │                │                │                │
+  │  (FIX MsgType  │                │                │                │                │                │                │
+  │   =D, AAPL,    │                │                │                │                │                │                │
+  │   Buy 100@     │                │                │                │                │                │                │
+  │   $150.10)     │                │                │                │                │                │                │
+  │                │── parse FIX ──▶│                │                │                │                │                │
+  │                │   normalize    │                │                │                │                │                │
+  │                │   to internal  │                │                │                │                │                │
+  │                │   format       │── validate ───▶│                │                │                │                │
+  │                │                │   auth, format │                │                │                │                │
+  │                │                │                │── risk checks: │                │                │                │
+  │                │                │                │   kill switch? │                │                │                │
+  │                │                │                │   fat-finger?  │                │                │                │
+  │                │                │                │   position ok? │                │                │                │
+  │                │                │                │   rate limit?  │                │                │                │
+  │                │                │                │   STP preview? │                │                │                │
+  │                │                │                │   (~500ns)     │                │                │                │
+  │                │                │                │                │                │                │                │
+  │                │                │  ◀── PASS ─────│                │                │                │                │
+  │                │                │                │                │                │                │                │
+  │                │                │────────────────────────────────▶│                │                │                │
+  │                │                │                │                │── assign       │                │                │
+  │                │                │                │                │   seq_num=4523 │                │                │
+  │                │                │                │                │── write WAL    │                │                │
+  │                │                │                │                │   (NVMe ~1μs)  │                │                │
+  │                │                │                │                │── replicate    │                │                │
+  │                │                │                │                │   to standby   │                │                │
+  │                │                │                │                │── publish to ─▶│                │                │
+  │                │                │                │                │   ring buffer  │── lookup AAPL  │                │
+  │                │                │                │                │                │   order book   │                │
+  │                │                │                │                │                │── best ask =   │                │
+  │                │                │                │                │                │   $150.10 (100)│                │
+  │                │                │                │                │                │── MATCH! fill  │                │
+  │                │                │                │                │                │   100@$150.10  │                │
+  │                │                │                │                │                │── update book  │                │
+  │                │                │                │                │                │── check stops  │                │
+  │                │                │                │                │                │── check LULD   │                │
+  │                │                │                │                │                │                │                │
+  │                │                │                │                │                │── exec report ▶│                │
+  │                │                │                │                │                │   (fill 100@   │── FIX 8       │
+  │                │                │                │                │                │    $150.10)    │   ExecType=F  │
+  │◀───────────────│◀───────────────│────────────────│────────────────│────────────────│◀───────────────│   to buyer    │
+  │  Fill confirm  │                │                │                │                │                │   + seller    │
+  │  (< 10μs       │                │                │                │                │                │                │
+  │   end-to-end)  │                │                │                │── trade rec ──▶│   (async)      │                │
+  │                │                │                │                │                │── book delta ──│───────────────▶│
+  │                │                │                │                │                │                │   multicast   │
+  │                │                │                │                │                │                │   UDP to all  │
+  │                │                │                │                │                │                │   subscribers │
+  │                │                │  ◀── position update ◀─────────│                │                │                │
+  │                │                │                │  (async: +100  │                │                │                │
+  │                │                │                │   AAPL for     │                │                │                │
+  │                │                │                │   buying firm) │                │                │                │
+```
+
+**Critical path latency budget** (total < 10μs):
+| Step | Latency |
+|---|---|
+| FIX parse + normalize | ~1-2 μs |
+| Risk checks (shared memory) | ~0.5 μs |
+| Sequencer (assign + NVMe WAL write) | ~1-2 μs |
+| Ring buffer publish + consume | ~0.1 μs |
+| Matching engine (lookup + match) | ~0.5-1 μs |
+| Execution report publish | ~0.5-1 μs |
+| FIX response serialize + send | ~1-2 μs |
+| **Total** | **~5-9 μs** |
+
 ### Component Deep Dive
 
 #### Matching Algorithm — Price-Time Priority
@@ -409,6 +481,181 @@ Implementation:
     This breaks the cascade and allows human intervention.
 ```
 
+#### IOC, FOK, and GTC — Time-in-Force Handling
+
+```
+Time-in-Force determines what happens to the UNFILLED portion of an order:
+
+DAY (default):
+  Order rests in book until end of trading day.
+  At 4:00 PM ET → all DAY orders automatically cancelled.
+  Implementation: end-of-day sweep iterates all order books, removes DAY orders.
+
+GTC (Good-Till-Cancelled):
+  Order persists across trading days until explicitly cancelled.
+  Survives overnight. Re-loaded on next market open from persistent store.
+  Risk: stale GTC orders from weeks ago can match at unexpected prices.
+  Some exchanges cap GTC at 90 days to prevent this.
+
+IOC (Immediate-or-Cancel):
+  Execute whatever quantity matches IMMEDIATELY, cancel the rest.
+  Never rests in the book. Zero book impact if no match.
+  
+  Example: IOC Buy 500 shares at $150.10
+    200 shares available at $150.10 → fill 200, cancel remaining 300.
+    Execution report: Partial Fill 200, then Cancelled 300.
+  
+  Used by: algo traders who want to "take" liquidity without showing intent.
+
+FOK (Fill-or-Kill):
+  ENTIRE order must fill immediately, or ENTIRE order is cancelled.
+  All-or-nothing. Even more restrictive than IOC.
+  
+  Example: FOK Buy 500 shares at $150.10
+    Only 200 shares available → REJECT (cancel entire order, fill nothing).
+    500 shares available → fill all 500.
+  
+  Implementation: before matching, check if total available qty at eligible 
+  prices >= order.qty. If not → reject without touching book.
+  Used by: institutional block traders who need exact fill sizes.
+
+  Matching engine implementation:
+    match(order):
+      if order.tif == IOC:
+        result = match_aggressive(order)  // match what's available
+        if order.remaining_qty > 0:
+          cancel(order, reason="IOC_UNFILLED")
+      
+      elif order.tif == FOK:
+        available = calculate_fillable_qty(order)
+        if available < order.qty:
+          reject(order, reason="FOK_INSUFFICIENT_LIQUIDITY")
+        else:
+          match_aggressive(order)  // guaranteed full fill
+      
+      elif order.tif == DAY or order.tif == GTC:
+        result = match_aggressive(order)
+        if order.remaining_qty > 0:
+          insert_into_book(order)  // rest unfilled portion
+```
+
+#### Cancel-on-Disconnect (CoD) — Algo Safety Mechanism
+
+```
+Problem: An algo trading firm's network connection drops.
+Their 10,000 resting orders are still in the book — but the algo can't manage them.
+If the market moves, those stale orders will fill at disadvantageous prices.
+
+Solution: Cancel-on-Disconnect (CoD)
+  When a FIX session disconnects (heartbeat timeout, TCP RST, etc.):
+    1. Gateway detects session loss (FIX heartbeat missed for 3 consecutive intervals)
+    2. Gateway sends mass cancel for ALL orders associated with that session
+    3. Matching engine cancels all resting orders for that firm + session_id
+    4. Execution reports (cancel confirms) are queued for when session reconnects
+  
+  Implementation:
+    Session state: HashMap<SessionId, Set<OrderId>>
+    On disconnect: for each order_id in session_orders:
+      send_cancel(order_id, reason="CANCEL_ON_DISCONNECT")
+    
+    Time to cancel all orders: ~1ms for 10,000 orders (10 cancels × 100ns each)
+  
+  Configuration per firm:
+    CoD enabled: yes/no (some firms prefer orders to persist through brief disconnects)
+    Grace period: 0-30 seconds (time to reconnect before mass cancel triggers)
+    Scope: all orders, or only orders entered in current session
+  
+  Edge case: firm reconnects DURING mass cancel
+    Some orders already cancelled, some not yet processed.
+    Solution: firm must reconcile state on reconnect by requesting full order status.
+    Matching engine provides "mass order status" query for this purpose.
+```
+
+#### Surveillance Engine — Market Abuse Detection
+
+```
+Consumes ALL order and trade events from Kafka (audit-trail topic).
+Runs asynchronous pattern detection — NOT in the matching critical path.
+
+Pattern 1: Spoofing / Layering Detection
+  Spoofer places large visible orders to fake demand, then cancels before execution.
+  
+  Detection algorithm:
+    For each firm, per instrument, in rolling 10-second windows:
+      large_orders = orders with qty > 10x average order size
+      cancel_rate = cancelled_large_orders / total_large_orders
+      cancel_speed = avg time between place and cancel of large orders
+      
+      if cancel_rate > 90% AND cancel_speed < 1 second AND 
+         price_moved_in_favor(firm's executions on opposite side):
+        → ALERT: suspected spoofing
+  
+  Example: Firm places 50,000 share buy order (visible), price ticks up, 
+  firm sells 5,000 shares at higher price, then cancels the 50,000 buy.
+  Pattern: inflate price → profit from opposite side → cancel inflating order.
+
+Pattern 2: Wash Trading Detection
+  Same entity trading with itself to create illusion of volume.
+  Even with STP enabled, can happen across sub-accounts or affiliated firms.
+  
+  Detection: graph analysis of trade counterparties.
+    Build graph: nodes = firm sub-accounts, edges = trades between them.
+    If a cluster of accounts repeatedly trade with each other and are 
+    controlled by same beneficial owner → ALERT.
+  
+  Also: statistical detection — if two accounts always appear as buyer/seller 
+  of the same trades at suspiciously correlated times.
+
+Pattern 3: Momentum Ignition
+  Rapid submission of orders designed to trigger other algo's stop orders or 
+  momentum strategies, then profiting from the resulting price move.
+  
+  Detection: unusual order submission rate from one firm immediately preceding 
+  a rapid price move, followed by that firm's executions on the opposite side.
+
+Pattern 4: Quote Stuffing
+  Submitting and cancelling thousands of orders per second to slow down competitors.
+  
+  Detection: order-to-trade ratio > 100:1 per firm per instrument per minute.
+  Some exchanges charge fees for excessive cancellation rates to discourage this.
+
+Technology: Apache Flink or Spark Streaming consuming from Kafka.
+  Complex event processing (CEP) rules engine for real-time alerting.
+  Historical analysis: batch Spark jobs on full day's data for deeper patterns.
+  Alerts → compliance team dashboard + regulatory reporting (FINRA, SEC).
+```
+
+#### Drop Copy Service — Real-Time Trade Reporting
+
+```
+Every broker connected to the exchange needs a real-time copy of their trades 
+and order acknowledgements — separate from the primary execution report feed.
+
+Why separate from execution reports?
+  1. Execution reports go to the TRADING session (the algo or trader).
+  2. Drop copy goes to the COMPLIANCE/RISK session (back office, middle office).
+  3. If the trading session disconnects, drop copy still delivers to compliance.
+  4. Multiple compliance systems can each receive their own drop copy.
+
+Implementation:
+  Matching engine outputs → Kafka "trade-reports" topic (keyed by firm_id)
+  Drop Copy Service: per-firm Kafka consumer → FIX drop copy session to firm's 
+  back-office system.
+  
+  Guaranteed delivery: Kafka offset tracking ensures no trade is missed.
+  If firm's drop copy connection is down → messages buffered in Kafka → 
+  delivered on reconnect (replay from last committed offset).
+
+Content per drop copy message:
+  - Trade ID, instrument, side, price, quantity, timestamp
+  - Order ID, original order details
+  - Counterparty firm ID (anonymized — identified as "Market" per exchange rules)
+  - Sequence number for gap detection
+
+Regulatory requirement: exchanges MUST provide drop copy capability.
+  FINRA Rule 7440: firms must have real-time trade reporting capability.
+```
+
 ---
 
 ## 5. APIs
@@ -636,7 +883,59 @@ Why deterministic replay is non-negotiable:
 
 ---
 
-## 8. Deep Dive
+## 8. Additional Considerations
+
+### Regulatory Compliance
+- **SEC Rule 613 (Consolidated Audit Trail)**: Must reconstruct any historical order book state from audit trail. Every order event (new, amend, cancel, fill) logged with nanosecond timestamp, participant ID, and sequence number
+- **Reg NMS (National Market System)**: Orders must be routed to the exchange with the best price (NBBO — National Best Bid/Offer). Exchange must publish quotes to the SIP (Securities Information Processor) within microseconds
+- **MiFID II (EU)**: Clock synchronization to 100μs granularity. Best execution reporting. Transaction reporting to regulators within T+1
+- **Market Access Rule (15c3-5)**: Brokers must have pre-trade risk controls before orders reach the exchange. Our pre-trade risk engine enforces this on behalf of member firms
+- **Audit retention**: All order and trade data retained for minimum 7 years (SEC) or 5 years (FINRA). Tiered storage: hot (NVMe) → warm (SSD) → cold (S3/Glacier)
+
+### Co-Location and Fairness
+- Trading firms co-locate servers in the same data center as the exchange
+- **Equal-length cables**: NYSE and NASDAQ provide equal-length network cables to all co-located firms — prevents any firm from having a physical proximity advantage
+- **Randomized processing**: Some exchanges (IEX) add a 350μs "speed bump" delay to all incoming orders to neutralize latency arbitrage
+- **Fee structure**: Co-location fees range from $5K–$20K/month per rack. Market data fees: $10K–$50K/month for full depth feed
+
+### Dark Pools and Alternative Execution
+- **Dark pool**: Off-exchange venue where orders are hidden (no visible order book)
+- Used by institutional investors to execute large block orders without moving the market
+- Matching logic similar to lit exchange but: no pre-trade transparency, mid-point matching common
+- Our exchange may operate a dark pool alongside the lit market — separate matching engine, shared instrument definitions
+
+### Multi-Asset Class Support
+- Equities (stocks, ETFs): price-time priority, penny tick increments
+- Options: additional complexity — strike, expiry, put/call, implied volatility, complex multi-leg orders (spreads, strangles)
+- Futures: similar to equities but with expiration, daily mark-to-market, margin requirements
+- Each asset class may have different matching rules, tick sizes, and circuit breaker thresholds
+- Shared infrastructure: gateway, sequencer, risk engine. Separate: matching engines per asset class
+
+### Market Making and Liquidity Programs
+- **Designated Market Makers (DMMs)**: Obligated to maintain continuous two-sided quotes (bid + ask) with minimum size and maximum spread
+- In return: fee rebates, priority in matching (some exchanges give DMMs last-look or size priority)
+- **Maker-taker fee model**: Liquidity providers (resting orders) receive rebate (~$0.002/share). Liquidity takers (crossing orders) pay fee (~$0.003/share)
+- **Inverted model (BATS BYX)**: Takers receive rebate, makers pay — attracts different order flow
+
+### Monitoring & Alerting
+- **Latency percentiles**: P50, P99, P99.9 for order-to-ack, match-to-trade-report, market-data-publish
+- **Throughput dashboards**: Orders/sec, trades/sec, cancels/sec — per instrument and aggregate
+- **Queue depth**: Sequencer input queue depth, matching engine ring buffer consumer lag
+- **Risk alerts**: Firm position breaches, order rate violations, kill switch activations
+- **System health**: CPU utilization per pinned core (should be < 30% to avoid thermal throttling), NVMe write latency, memory allocation rate (should be zero on hot path)
+- **Market quality metrics**: Bid-ask spread, order book depth, trade-through rate (orders executing at worse-than-NBBO prices)
+
+### End-of-Day and Corporate Actions
+- **End-of-day**: Cancel all DAY orders at market close. GTC orders persist overnight. Publish official closing prices (from closing auction)
+- **Corporate actions**: Stock splits, dividends, mergers require adjusting open orders
+  - Stock split 2:1: all resting order prices halved, quantities doubled
+  - Ex-dividend date: adjust open limit orders by dividend amount
+  - Applied overnight between close and next open — matching engine offline during adjustment
+- **Symbology changes**: Ticker changes (e.g., FB → META) require updating instrument definitions, order book migration
+
+---
+
+## 9. Deep Dive: Engineering Trade-offs
 
 ### LMAX Disruptor Pattern
 
@@ -822,13 +1121,23 @@ Implementation in matching loop:
   and you need to skip it and match against the NEXT resting order at that price.
 ```
 
-### Market Data Distribution — Multicast Architecture
+### Market Data Distribution — Multicast vs Unicast vs Kafka
 
 ```
 5M market data updates/sec. 10,000+ subscribers. How to deliver efficiently?
 
-Unicast (TCP to each subscriber):
+Unicast TCP (to each subscriber):
   5M × 10,000 = 50B messages/sec. Impossible.
+  ✗ Does not scale with subscriber count
+  ✗ Each subscriber adds server-side load
+  ✓ Reliable delivery (TCP guarantees order)
+
+Kafka (fan-out):
+  5M messages/sec → Kafka → 10,000 consumers
+  ✗ Latency: 2-5ms per message (too slow for co-located HFT firms)
+  ✗ Consumer coordination overhead
+  ✓ Built-in replication and retention
+  ✓ Acceptable for non-latency-sensitive consumers (analytics, compliance)
 
 Multicast UDP ⭐ (what real exchanges use):
   Exchange sends ONE copy per update to multicast group address.
@@ -854,6 +1163,52 @@ Multicast UDP ⭐ (what real exchanges use):
     Trading firms place servers in same data center as exchange (< 1 mile of fiber).
     Market data latency: 5-20 μs from matching engine to co-located subscriber.
     Remote subscribers (over WAN): 1-50 ms latency (depends on distance).
+
+Decision: Multicast UDP for co-located low-latency consumers. Kafka for async 
+downstream (analytics, compliance, drop copy). Both running in parallel.
+```
+
+### Why Java/C++ (Not Go/Rust/Python) for the Matching Engine?
+
+```
+Python:
+  ✗ GIL prevents true parallelism (irrelevant for single-threaded, but GC pauses)
+  ✗ Interpreted: 100x slower than compiled for tight loops
+  ✗ No control over memory layout, allocation, or GC timing
+  ✗ No exchange in the world uses Python for matching
+
+Go:
+  ✗ GC pauses: Go's GC targets < 500μs pause time — UNACCEPTABLE at μs latency
+  ✗ No control over object layout (runtime decides)
+  ✗ goroutine scheduling adds non-deterministic latency
+  ✓ Great for gateway/risk services (not latency-critical path)
+
+Rust:
+  ✓ Zero-cost abstractions, no GC, deterministic memory management
+  ✓ Ownership model prevents data races at compile time
+  ✗ Smaller ecosystem for financial systems (fewer battle-tested libraries)
+  ✗ Hiring pool is smaller than Java/C++ in finance
+  ✓ Growing adoption: some new exchanges (e.g., Serum/Solana DEX) use Rust
+
+C++ ⭐ (most exchanges):
+  ✓ Zero overhead: no GC, manual memory management, inline assembly possible
+  ✓ Full control over cache layout (struct packing, alignment, placement new)
+  ✓ Kernel bypass (DPDK, RDMA) for sub-μs networking
+  ✓ Used by: NYSE (Pillar), NASDAQ (INET), LSE (Millennium), CME (Globex)
+  ✗ Memory safety issues (buffer overflows, use-after-free)
+  ✗ Complex build systems, slow compilation
+
+Java ⭐ (LMAX, some exchanges):
+  ✓ JIT compilation: hot loops optimized to near-C++ performance
+  ✓ LMAX Disruptor pattern achieves < 1μs latency in Java
+  ✓ Easier to develop and maintain than C++
+  ✗ GC pauses — mitigated by: zero-allocation hot path, off-heap memory,
+    Azul Zing JVM (pauseless GC), or GraalVM
+  ✓ Used by: LMAX Exchange, some prop trading firms
+
+Decision: C++ for the matching engine hot path (sequencer + matching + market data).
+Java for gateway services, risk engine, and trade store.
+Python for analytics, surveillance, and batch reporting.
 ```
 
 ### Clearing and Settlement — T+1
@@ -883,3 +1238,164 @@ Clearing service in our architecture:
 This is the ONLY part of the exchange that doesn't need microsecond latency.
 Batch processing at end of day is fine.
 ```
+
+### Order Book Data Structure: TreeMap vs Array vs Skip List
+
+```
+TreeMap<Price, LinkedList<Order>> (Red-Black Tree):
+  Insert at new price: O(log P) where P = distinct price levels
+  Best price lookup: O(1) with cached min/max pointer
+  Iterate price levels: O(1) per level (in-order traversal)
+  Memory: Pointer-heavy → poor cache locality
+  ✓ Handles arbitrary price levels efficiently
+  ✓ Standard library available in Java/C++
+  ✗ O(log P) insert at new price — matters when P is large
+
+Array indexed by price (direct-mapped):
+  Price range: $0.01 to $10,000.00 = 1,000,000 price levels (cents)
+  Array[price_in_cents] → LinkedList<Order>
+  Insert/lookup: O(1) always (direct index)
+  Best price: scan from top → O(P) worst case; O(1) with cached pointer
+  ✓ O(1) everything with cached best pointer
+  ✓ Excellent cache locality (contiguous memory)
+  ✗ Wastes memory for sparse price ranges (most slots empty)
+  ✗ Price range must be bounded
+  ✓ Used by some HFT firms for instruments with known price ranges
+
+Skip List:
+  Probabilistic balanced structure
+  Insert/lookup: O(log P) expected
+  ✓ Lock-free implementations exist (ConcurrentSkipListMap)
+  ✗ Not needed since matching is single-threaded
+  ✗ More pointer chasing → worse cache locality than array
+
+Recommended ⭐: TreeMap for general case (handles any instrument).
+Array for hot instruments with bounded price ranges (AAPL, SPY) where
+every nanosecond matters.
+```
+
+### FIX Protocol vs Proprietary Binary: Gateway Protocol Choice
+
+```
+FIX (Financial Information eXchange) — text-based:
+  "8=FIX.4.4|35=D|49=BROKER1|55=AAPL|54=1|38=100|44=15010|..."
+  ✓ Industry standard — every broker speaks FIX
+  ✓ Human-readable for debugging
+  ✗ Parsing overhead: string splitting, field lookup by tag
+  ✗ Message size: ~200-500 bytes for a new order
+  ✗ Latency: 5-20μs to parse a FIX message
+
+FIX with SBE (Simple Binary Encoding):
+  Binary encoding of FIX messages — same semantics, binary wire format
+  ✓ Parse in < 1μs (direct memory access, no string parsing)
+  ✓ Message size: ~50-100 bytes (4-5x smaller)
+  ✓ Compatible with FIX semantics (easy migration)
+  ✗ Not human-readable on the wire
+
+Proprietary binary (exchange-specific):
+  Custom binary protocol optimized for the exchange's specific needs
+  ✓ Absolute minimum latency (< 0.5μs parse time)
+  ✓ Minimum message size
+  ✗ Every client must implement a custom adapter
+  ✗ Maintenance burden: protocol changes require all clients to update
+  ✓ Used by: CME (iLink), NASDAQ (OUCH), NYSE (Pillar Gateway)
+
+Decision: FIX/SBE for standard client-facing gateway. Proprietary binary
+for co-located ultra-low-latency clients willing to implement custom adapters.
+Both gateways normalize to the same internal format before hitting the sequencer.
+```
+
+### Matching Priority Models: Price-Time vs Pro-Rata vs Size-Time
+
+```
+Price-Time Priority ⭐ (most equity exchanges — NYSE, NASDAQ):
+  1. Best price wins (highest bid, lowest ask)
+  2. Within same price: first order in time wins (FIFO)
+  
+  ✓ Simple, fair, transparent
+  ✓ Rewards speed → incentivizes tighter quotes
+  ✓ Standard for equities — regulatory expectation
+  ✗ Favors speed → arms race for microseconds (co-location, FPGA)
+  ✗ Small retail orders can't compete with HFT for time priority
+
+Pro-Rata (some options exchanges — CBOE, CME for futures):
+  1. Best price wins
+  2. Within same price: allocated proportionally to order size
+  
+  Example: 3 orders resting at $150.10:
+    Order A: 100 shares, Order B: 300 shares, Order C: 600 shares
+    Incoming sell matches 500 shares at $150.10
+    Allocation: A gets 50, B gets 150, C gets 300 (proportional to size)
+  
+  ✓ Rewards SIZE (quoting large) rather than speed
+  ✓ Reduces latency arms race
+  ✗ Incentivizes oversized quotes (quote more than you want to fill)
+  ✗ Fragmentation: multiple small fills per order
+  ✗ More complex implementation (calculate proportional allocation per match)
+
+Size-Time Priority (some options exchanges):
+  1. Best price
+  2. Largest order first (not proportional — winner-take-all by size)
+  3. Ties in size broken by time
+  
+  ✓ Strongly rewards providing deep liquidity
+  ✗ Small market makers disadvantaged
+
+Price-Time with DMM Parity (NYSE for listed stocks):
+  1. Best price
+  2. DMM (Designated Market Maker) gets priority at each price level
+  3. Remaining allocated FIFO among other orders
+  
+  ✓ Incentivizes DMMs to provide continuous quotes (reduces spreads)
+  ✗ Creates two classes of market participants (DMM vs everyone else)
+
+Our design uses Price-Time Priority:
+  - Standard for equities
+  - Simplest to implement and reason about
+  - Regulatory default expectation
+  - Single-threaded FIFO matching naturally implements this
+  
+  Pro-rata would be needed if designing an options or futures exchange.
+```
+
+### NVMe WAL vs Battery-Backed RAM vs Persistent Memory: Storage for Sequencer
+
+```
+The sequencer's WAL write is the single biggest latency bottleneck.
+Every order MUST be persisted before acknowledgement (regulatory requirement).
+
+Regular SSD (SATA):
+  fsync latency: 50-200 μs
+  ✗ Way too slow for exchange use
+  ✗ Would add 50-200μs to every order
+
+NVMe SSD ⭐ (most exchanges):
+  fsync latency: 5-20 μs (Intel Optane: 7-10 μs)
+  Throughput: 500K+ IOPS for 4KB writes
+  ✓ Good balance of cost, performance, and durability
+  ✓ Commodity hardware, widely available
+  ✗ Still 5-20μs per write — dominates the latency budget
+
+Battery-Backed RAM (BBRAM / NVDIMM):
+  Write latency: 0.1-0.5 μs (100-500 nanoseconds!)
+  Data survives power loss (battery keeps RAM powered for ~72 hours)
+  ✓ 10-100x faster than NVMe
+  ✓ Used by top-tier exchanges for absolute minimum latency
+  ✗ Expensive ($$$)
+  ✗ Capacity limited (typically 128-512 GB per DIMM)
+  ✗ Battery maintenance required
+  ✗ If battery fails during power outage → data loss
+
+Intel Optane Persistent Memory (PMEM):
+  Write latency: 0.3-1 μs
+  Byte-addressable (no block I/O overhead)
+  ✓ Faster than NVMe, cheaper than BBRAM
+  ✗ Intel discontinued Optane line (2022) — limited future availability
+  ✗ Requires special programming model (libpmem)
+
+Decision: NVMe (Intel Optane SSD) for most deployments.
+BBRAM for the top 5-10 hottest instrument partitions where every μs matters.
+The replication to standby provides the durability guarantee; the local WAL 
+provides regulatory compliance for "order received" timestamping.
+```
+
