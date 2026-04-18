@@ -248,7 +248,7 @@ The core loop that fires due jobs — runs every 1 second on the leader:
 while leader:
     now = current_timestamp()
     current_bucket = floor(now / 60)
-    prev_bucket = current_bucket - 60  # catch boundary stragglers
+    prev_bucket = current_bucket - 1  # catch boundary stragglers
     
     for bucket in [prev_bucket, current_bucket]:
         due_jobs = ZRANGEBYSCORE timer:bucket:{bucket} 0 {now} LIMIT 0 100
